@@ -88,24 +88,34 @@ def generate_and_score(prompts: np.ndarray,
         else:
             generated_tokens = input_ids
         
-        # Forward pass for scoring
+# Forward pass for scoring
         outputs = model(generated_tokens, labels=generated_tokens)
         
-        # Calculate base likelihood scores
-        loss_per_token = calculate_likelihood_scores(outputs, generated_tokens, SUFFIX_LEN)
+        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        full_loss_per_token = torch.nn.functional.cross_entropy(
+            full_logits, 
+            generated_tokens[:, 1:].flatten(), 
+            reduction='none'
+        )
+
+        high_conf_scores = calculate_high_confidence_scores(
+            outputs.logits[:, :-1],
+            full_loss_per_token,
+            SUFFIX_LEN
+        )
+        scores["high_confidence"].extend(high_conf_scores)
+
+        loss_per_token = full_loss_per_token.reshape(
+            -1, generated_tokens.shape[1] - 1
+        )[:, -SUFFIX_LEN:]
         likelihood = loss_per_token.mean(1)
         scores["likelihood"].extend(likelihood.cpu().numpy())
         
-        # Calculate other base scores
         zlib_scores = calculate_zlib_scores(generated_tokens, likelihood)
         scores["zlib"].extend(zlib_scores)
         
         metric_scores = calculate_metric_scores(loss_per_token)
         scores["metric"].extend(metric_scores)
-        
-        high_conf_scores = calculate_high_confidence_scores(outputs.logits[:, :-1], loss_per_token)
-        scores["high_confidence"].extend(high_conf_scores)
-        
         # Calculate recall scores using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=4) as executor:
             recall_futures = []

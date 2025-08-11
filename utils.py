@@ -185,17 +185,24 @@ def calculate_metric_scores(loss_per_token: torch.Tensor) -> np.ndarray:
     return metric_loss.mean(1)
 
 
-def calculate_high_confidence_scores(logits: torch.Tensor, loss_per_token: torch.Tensor) -> np.ndarray:
-    """Calculate high confidence scores."""
-    top_scores, _ = logits.topk(2, dim=-1)
+def calculate_high_confidence_scores(
+    full_logits: torch.Tensor, 
+    full_loss_per_token: torch.Tensor, 
+    suffix_len: int
+) -> np.ndarray:
+    """Calculate high confidence scores, matching the logic from baseline_highconf."""
+    top_scores, _ = full_logits.topk(2, dim=-1)
     flag1 = (top_scores[:, :, 0] - top_scores[:, :, 1]) > 0.5
     flag2 = top_scores[:, :, 0] > 0
+    flat_flag1 = flag1.reshape(-1)
+    flat_flag2 = flag2.reshape(-1)
+
+    mean_batch_loss = full_loss_per_token.mean()
+    loss_adjusted_flat = full_loss_per_token - (flat_flag1.int() - flat_flag2.int()) * mean_batch_loss * 0.15
+    loss_adjusted_reshaped = loss_adjusted_flat.reshape(full_logits.shape[0], -1)
+    loss_adjusted_suffix = loss_adjusted_reshaped[:, -suffix_len:]
     
-    mean_per_token = loss_per_token.mean(dim=1, keepdim=True)
-    
-    # Apply confidence adjustments
-    loss_adjusted = loss_per_token - (flag1.int() - flag2.int()) * mean_per_token * 0.15
-    return loss_adjusted.mean(1).cpu().numpy()
+    return loss_adjusted_suffix.mean(1).cpu().numpy()
 
 
 def write_guesses_to_csv(generations_per_prompt: int, 
