@@ -9,6 +9,7 @@ import os
 import argparse
 import numpy as np
 import torch
+import pandas as pd
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -88,7 +89,7 @@ def generate_and_score(prompts: np.ndarray,
         else:
             generated_tokens = input_ids
         
-# Forward pass for scoring
+        # Forward pass for scoring
         outputs = model(generated_tokens, labels=generated_tokens)
         
         full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
@@ -116,6 +117,7 @@ def generate_and_score(prompts: np.ndarray,
         
         metric_scores = calculate_metric_scores(loss_per_token)
         scores["metric"].extend(metric_scores)
+        
         # Calculate recall scores using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=4) as executor:
             recall_futures = []
@@ -259,14 +261,16 @@ def run_extraction(args):
             generation_params=generation_params
         )
         
-        # Save results
-        generation_path = os.path.join(generations_base, "{}.npy")
-        write_array(generation_path, generations, trial)
+        if args.save_npy_files:
+            generation_path = os.path.join(generations_base, "{}.npy")
+            write_array(generation_path, generations, trial)
+            for method in scoring_methods:
+                if len(scores[method]) > 0:
+                    losses_path = os.path.join(losses_base, f"{method}_{{}}.npy")
+                    write_array(losses_path, scores[method], trial)
         
         for method in scoring_methods:
-            if len(scores[method]) > 0:  # Only save non-empty scores
-                losses_path = os.path.join(losses_base, f"{method}_{{}}.npy")
-                write_array(losses_path, scores[method], trial)
+            if len(scores[method]) > 0:
                 all_scores[method].append(scores[method])
         
         all_generations.append(generations)
@@ -274,25 +278,33 @@ def run_extraction(args):
     # Stack results
     all_generations = np.stack(all_generations, axis=1)
     for method in scoring_methods:
-        if all_scores[method]:  # Only stack non-empty lists
+        if all_scores[method]:
             all_scores[method] = np.stack(all_scores[method], axis=1)
     
     print(f"Generated shape: {all_generations.shape}")
     
     # Load ground truth for evaluation
     answers = load_prompts(args.dataset_dir, "train_dataset.npy")[-args.val_set_num:, -100:]
+
+    max_generations_per_prompt = all_generations.shape[1]
+    if args.save_all_generations_per_prompt:
+        generations_to_process = [1, 5, 10, 20, 50, max_generations_per_prompt]
+        generations_to_process = [g for g in generations_to_process if g <= max_generations_per_prompt]
+    else:
+        generations_to_process = [max_generations_per_prompt]
+
+    all_metrics_data = []
     
-    # Process results for different generation counts
-    for generations_per_prompt in [1, 5, 10, 20, 50, all_generations.shape[1]]:
-        if generations_per_prompt > all_generations.shape[1]:
-            continue
-            
-        print(f"\nProcessing results for {generations_per_prompt} generations per prompt...")
+    # Always process all generation tiers for the final summary CSV
+    full_generations_tiers = [1, 5, 10, 20, 50, max_generations_per_prompt]
+    full_generations_tiers = sorted(list(set([g for g in full_generations_tiers if g <= max_generations_per_prompt])))
+    
+    for generations_per_prompt in full_generations_tiers:
+        print(f"\nCalculating metrics for {generations_per_prompt} generations per prompt...")
         
         limited_generations = all_generations[:, :generations_per_prompt, :]
         generations_dict = {}
         
-        # Get methods with valid scores
         valid_methods = [method for method in scoring_methods if len(all_scores[method]) > 0]
         argmin_methods = get_argmin_methods()
         argmax_methods = get_argmax_methods(K_RATIOS)
@@ -300,23 +312,48 @@ def run_extraction(args):
         for method in valid_methods:
             limited_scores = all_scores[method][:, :generations_per_prompt]
             
-            # Select best generations based on scoring method
             if method in argmin_methods:
                 best_indices = limited_scores.argmin(axis=1)
-            else:  # argmax methods
+            else:
                 best_indices = limited_scores.argmax(axis=1)
             
             prompt_indices = np.arange(limited_generations.shape[0])
             generations_dict[method] = limited_generations[prompt_indices, best_indices, :]
         
-        # Write results to CSV
-        write_guesses_to_csv(generations_per_prompt, generations_dict, answers, valid_methods)
+        # Decide which guess files to write based on flags
+        if generations_per_prompt in generations_to_process:
+            if args.save_all_methods:
+                methods_to_save_csv = valid_methods
+            else:
+                methods_to_save_csv = ["likelihood"] if "likelihood" in valid_methods else []
+            
+            if methods_to_save_csv:
+                write_guesses_to_csv(generations_per_prompt, generations_dict, answers, methods_to_save_csv)
         
-        # Calculate and print metrics
         metrics = calculate_metrics(generations_dict, answers)
         for method, method_metrics in metrics.items():
-            print(f"{method}: precision={method_metrics['precision']:.3f}, "
-                  f"hamming_distance={method_metrics['hamming_distance']:.2f}")
+            all_metrics_data.append({
+                'generations_per_prompt': generations_per_prompt,
+                'method': method,
+                'precision': method_metrics['precision'],
+                'hamming_distance': method_metrics['hamming_distance']
+            })
+
+    df_metrics = pd.DataFrame(all_metrics_data)
+    if not df_metrics.empty:
+        results_csv_path = os.path.join(experiment_base, "extraction_metrics_summary.csv")
+        df_metrics.to_csv(results_csv_path, index=False, float_format='%.4f')
+        print(f"\nExtraction metrics summary saved to {results_csv_path}")
+
+    print(f"\nResults for {max_generations_per_prompt} generations per prompt:")
+    if not df_metrics.empty:
+        max_n_metrics = df_metrics[df_metrics['generations_per_prompt'] == max_generations_per_prompt]
+        if not max_n_metrics.empty:
+            print(max_n_metrics.to_string(index=False))
+        else:
+            print("No metrics calculated for the maximum number of generations.")
+    else:
+        print("No metrics were generated.")
 
 
 def main():
@@ -352,6 +389,14 @@ def main():
     parser.add_argument('--repetition_penalty', type=float, default=1.04,
                        help='Repetition penalty for generation')
     
+    # Saving arguments
+    parser.add_argument('--save_all_generations_per_prompt', action='store_true',
+                       help='Save guess CSVs for all generation count tiers (1, 5, 10, etc.)')
+    parser.add_argument('--save_all_methods', action='store_true',
+                       help='Save guess CSVs for all scoring methods, not just likelihood')
+    parser.add_argument('--save_npy_files', action='store_true',
+                       help='Save intermediate generation and loss .npy files')
+
     # Other arguments
     parser.add_argument('--seed', type=int, default=2022,
                        help='Random seed for reproducibility')

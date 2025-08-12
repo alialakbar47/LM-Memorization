@@ -72,6 +72,14 @@ def main():
     parser.add_argument('--repetition_penalty', type=float, default=1.04,
                        help='Repetition penalty for generation')
     
+    # Saving arguments
+    parser.add_argument('--save_all_generations_per_prompt', action='store_true',
+                       help='Save guess CSVs for all generation count tiers (1, 5, 10, etc.)')
+    parser.add_argument('--save_all_methods', action='store_true',
+                       help='Save guess CSVs for all scoring methods, not just likelihood')
+    parser.add_argument('--save_npy_files', action='store_true',
+                       help='Save intermediate generation and loss .npy files')
+
     # Other arguments
     parser.add_argument('--seed', type=int, default=2022,
                        help='Random seed for reproducibility')
@@ -113,15 +121,21 @@ def main():
             "--seed", str(args.seed)
         ]
         
+        if args.save_all_generations_per_prompt:
+            extraction_command.append("--save_all_generations_per_prompt")
+        if args.save_all_methods:
+            extraction_command.append("--save_all_methods")
+        if args.save_npy_files:
+            extraction_command.append("--save_npy_files")
+        
         run_command(extraction_command, "Data Extraction")
         
         # Check if CSV files were generated
         csv_files = list(Path(".").glob("guess_*.csv"))
         if not csv_files:
-            print("Error: No guess CSV files found after extraction")
-            sys.exit(1)
-        
-        print(f"Generated {len(csv_files)} guess files")
+            print("Warning: No guess CSV files found after extraction. This is expected if MIA evaluation is skipped.")
+        else:
+            print(f"Generated {len(csv_files)} guess files for MIA evaluation.")
     
     # Step 2: MIA Evaluation
     if not args.skip_mia:
@@ -137,7 +151,9 @@ def main():
             sys.exit(1)
         
         for csv_file in csv_files:
-            csv_file.rename(Path(guess_dir) / csv_file.name)
+            # Move file, overwriting if it exists from a previous run
+            target_path = Path(guess_dir) / csv_file.name
+            csv_file.replace(target_path)
         
         mia_command = [
             sys.executable, "evaluate_mia.py",
@@ -158,26 +174,35 @@ def main():
     if not args.skip_extraction:
         experiment_path = Path(args.root_dir) / args.experiment_name
         if experiment_path.exists():
-            gen_files = list((experiment_path / "generations").glob("*.npy"))
-            loss_files = list((experiment_path / "losses").glob("*.npy"))
             print(f"- Experiment data: {experiment_path}")
-            print(f"  - Generation files: {len(gen_files)}")
-            print(f"  - Loss files: {len(loss_files)}")
+            
+            gen_files = list((experiment_path / "generations").glob("*.npy"))
+            if gen_files:
+                print(f"  - Generation files: {len(gen_files)}")
+
+            loss_files = list((experiment_path / "losses").glob("*.npy"))
+            if loss_files:
+                print(f"  - Loss files: {len(loss_files)}")
+            
+            summary_csv = experiment_path / "extraction_metrics_summary.csv"
+            if summary_csv.exists():
+                print(f"- Extraction metrics summary: {summary_csv}")
     
     if not args.skip_mia:
         results_path = Path("results/mia_evaluation")
         if results_path.exists():
             result_files = list(results_path.glob("*.csv"))
-            print(f"- MIA evaluation results: {results_path}")
-            print(f"  - Result files: {len(result_files)}")
-            for result_file in result_files:
-                print(f"    - {result_file.name}")
+            if result_files:
+                print(f"- MIA evaluation results: {results_path}")
+                for result_file in result_files:
+                    print(f"    - {result_file.name}")
     
     guess_path = Path("guess_files")
     if guess_path.exists():
         guess_files = list(guess_path.glob("*.csv"))
-        print(f"- Guess files: {guess_path}")
-        print(f"  - CSV files: {len(guess_files)}")
+        if guess_files:
+            print(f"- Guess files for MIA: {guess_path}")
+            print(f"  - CSV files: {len(guess_files)}")
 
 
 if __name__ == "__main__":

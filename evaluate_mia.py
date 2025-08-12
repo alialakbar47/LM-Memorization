@@ -269,20 +269,28 @@ def run_mia_evaluation(args):
                 key = f'recall_at_precision_{p_threshold}'
                 results[key].append(f"{metrics[key]:.3f}")
     
-    # Create and save results DataFrame
+    if not results:
+        print("\nNo results were generated from the provided guess files.")
+        return
+
     df_results = pd.DataFrame(results)
-    print("\nResults Summary:")
-    print(df_results.head(10))
-    
-    # Save results
+
+    # Save full results to CSV
     save_root = "results/mia_evaluation"
     os.makedirs(save_root, exist_ok=True)
-    
     model_id = args.model.split('/')[-1]
     output_file = os.path.join(save_root, f"{model_id}_mia_results.csv")
-    
     df_results.to_csv(output_file, index=False)
-    print(f"\nResults saved to {output_file}")
+    print(f"\nFull MIA evaluation results saved to {output_file}")
+
+    # Print a cleaner summary to the console
+    print("\nResults Summary:")
+    summary_cols = ['file', 'method', 'auroc', 'avg_precision', 'fpr95', 'tpr05']
+    display_cols = [col for col in summary_cols if col in df_results.columns]
+    if display_cols:
+        print(df_results[display_cols].to_string(index=False))
+    else:
+        print("No summary columns found in results.")
 
 
 def main():
