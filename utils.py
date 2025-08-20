@@ -38,6 +38,12 @@ def load_model_and_tokenizer(model_name: str = "EleutherAI/gpt-neo-1.3B"):
     )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            # Set a default pad token id if none exists
+            tokenizer.pad_token_id = 50256
     return model, tokenizer
 
 
@@ -72,74 +78,103 @@ def prepare_directories(root_dir: str, experiment_name: str):
     return experiment_base, generations_base, losses_base
 
 
+def perturb_prefix(prefix_tokens: torch.Tensor, vocab_size: int, p: float = 0.2) -> torch.Tensor:
+    """Randomly replaces a fraction `p` of tokens in a prefix."""
+    perturbed_tokens = prefix_tokens.clone()
+    num_to_perturb = int(len(prefix_tokens) * p)
+    if num_to_perturb == 0 and len(prefix_tokens) > 0:
+        num_to_perturb = 1
+    
+    indices_to_perturb = torch.randperm(len(prefix_tokens))[:num_to_perturb]
+    replacements = torch.randint(0, vocab_size, (num_to_perturb,), device=prefix_tokens.device)
+    perturbed_tokens[indices_to_perturb] = replacements
+    return perturbed_tokens
+
+
 @torch.no_grad()
-def calculate_likelihood_scores(model_outputs, generated_tokens: torch.Tensor, suffix_len: int) -> torch.Tensor:
-    """Calculate log-likelihood scores efficiently."""
-    logits = model_outputs.logits[:, :-1].reshape((-1, model_outputs.logits.shape[-1])).float()
-    
-    loss_per_token = F.cross_entropy(
-        logits, 
-        generated_tokens[:, 1:].flatten(), 
-        reduction='none'
-    ).reshape((-1, generated_tokens.shape[1] - 1))[:, -suffix_len:]
-    
-    return loss_per_token
+def get_ll(model, tokens: torch.Tensor, device: torch.device) -> float:
+    """Helper to get the mean log-likelihood of a sequence."""
+    outputs = model(tokens.unsqueeze(0).to(device))
+    logits = outputs.logits[:, :-1]
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=tokens[1:].unsqueeze(0).unsqueeze(-1)).squeeze()
+    return token_log_probs.mean().item()
+
+
+@torch.no_grad()
+def get_cond_ll(model, prefix: torch.Tensor, suffix: torch.Tensor, device: torch.device) -> float:
+    """Helper to get the mean conditional log-likelihood of a suffix given a prefix."""
+    prefix_outputs = model(prefix.unsqueeze(0).to(device))
+    cache = DynamicCache.from_legacy_cache(prefix_outputs.past_key_values)
+    suffix_outputs = model(suffix.unsqueeze(0).to(device), past_key_values=cache)
+    logits = suffix_outputs.logits[:, :-1]
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=suffix[1:].unsqueeze(0).unsqueeze(-1)).squeeze()
+    return token_log_probs.mean().item()
 
 
 @torch.no_grad()
 def calculate_recall_scores(prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor, 
                           model, device: torch.device) -> Tuple[float, float]:
     """Calculate recall scores using prefix-suffix split."""
-    # Unconditional LL (suffix only)
-    suffix_outputs = model(suffix_tokens.unsqueeze(0).to(device))
-    suffix_logits = suffix_outputs.logits[:, :-1]
-    suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
-    suffix_token_log_probs = suffix_log_probs.gather(
-        dim=-1,
-        index=suffix_tokens[1:].unsqueeze(0).unsqueeze(-1)
-    ).squeeze(-1)
-    ll_unconditional = suffix_token_log_probs.mean().item()
-    
-    # Conditional LL using KV cache
-    prefix_outputs = model(prefix_tokens.unsqueeze(0).to(device))
-    cache = DynamicCache.from_legacy_cache(prefix_outputs.past_key_values)
-    suffix_outputs = model(suffix_tokens.unsqueeze(0).to(device), past_key_values=cache)
-    suffix_logits = suffix_outputs.logits[:, :-1]
-    suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
-    suffix_token_log_probs = suffix_log_probs.gather(
-        dim=-1,
-        index=suffix_tokens[1:].unsqueeze(0).unsqueeze(-1)
-    ).squeeze(-1)
-    ll_conditional = suffix_token_log_probs.mean().item()
-    
+    ll_unconditional = get_ll(model, suffix_tokens, device)
+    ll_conditional = get_cond_ll(model, prefix_tokens, suffix_tokens, device)
     return ll_unconditional, ll_conditional
 
 
 @torch.no_grad()
-def calculate_original_recall(non_member_prefix_tokens: torch.Tensor, 
-                            input_tokens: torch.Tensor, 
-                            suffix_tokens: torch.Tensor, 
-                            model, device: torch.device) -> Tuple[float, float]:
-    """Calculate original recall using non-member prefix."""
-    # Unconditional LL (input + suffix)
-    full_sequence = torch.cat((input_tokens.unsqueeze(0), suffix_tokens.unsqueeze(0)), dim=1)
-    outputs = model(full_sequence.to(device), labels=full_sequence.to(device))
-    ll_unconditional = -outputs.loss.item()
+def calculate_suffix_con_recall(prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor,
+                               model, tokenizer, device: torch.device) -> float:
+    """Calculate suffix-based contrastive recall."""
+    ll_unconditional = get_ll(model, suffix_tokens, device)
+    ll_cond_member = get_cond_ll(model, prefix_tokens, suffix_tokens, device)
     
-    # Conditional LL (non_member_prefix + input + suffix)
-    full_sequence_with_prefix = torch.cat((
-        non_member_prefix_tokens.unsqueeze(0),
-        input_tokens.unsqueeze(0),
-        suffix_tokens.unsqueeze(0)
-    ), dim=1)
+    perturbed_prefix = perturb_prefix(prefix_tokens, tokenizer.vocab_size)
+    ll_cond_non_member = get_cond_ll(model, perturbed_prefix, suffix_tokens, device)
     
-    labels = full_sequence_with_prefix.clone()
-    labels[:, :non_member_prefix_tokens.size(0)] = -100
+    return (ll_cond_member - ll_cond_non_member) / (abs(ll_unconditional) + 1e-9)
+
+
+@torch.no_grad()
+def calculate_recall(non_member_prefix_tokens: torch.Tensor, 
+                     input_tokens: torch.Tensor, 
+                     suffix_tokens: torch.Tensor, 
+                     model, device: torch.device) -> Tuple[float, float]:
+    """
+    Calculate recall score based on NLL ratio, matching the provided recall.py logic.
+    Returns (unconditional_nll, conditional_nll).
+    """
+    full_sequence = torch.cat((input_tokens, suffix_tokens)).to(device)
+    outputs = model(full_sequence.unsqueeze(0), labels=full_sequence.unsqueeze(0))
+    nll_unconditional = outputs.loss.item()
     
-    outputs = model(full_sequence_with_prefix.to(device), labels=labels.to(device))
-    ll_conditional = -outputs.loss.item()
+    full_sequence_with_prefix = torch.cat((non_member_prefix_tokens, input_tokens, suffix_tokens)).to(device)
+    outputs_with_prefix = model(full_sequence_with_prefix.unsqueeze(0), labels=full_sequence_with_prefix.unsqueeze(0))
+    nll_conditional = outputs_with_prefix.loss.item()
     
-    return ll_unconditional, ll_conditional
+    return nll_unconditional, nll_conditional
+
+
+@torch.no_grad()
+def calculate_con_recall(
+    non_member_prefix_tokens: torch.Tensor,
+    member_prefix_tokens: torch.Tensor,
+    full_sequence_tokens: torch.Tensor,
+    original_nll: float,
+    model,
+    device: torch.device
+) -> float:
+    """Calculate contrastive recall score."""
+    nm_prefixed_sequence = torch.cat((non_member_prefix_tokens, full_sequence_tokens)).to(device)
+    nm_outputs = model(nm_prefixed_sequence.unsqueeze(0), labels=nm_prefixed_sequence.unsqueeze(0))
+    nll_non_member = nm_outputs.loss.item()
+    
+    m_prefixed_sequence = torch.cat((member_prefix_tokens, full_sequence_tokens)).to(device)
+    m_outputs = model(m_prefixed_sequence.unsqueeze(0), labels=m_prefixed_sequence.unsqueeze(0))
+    nll_member = m_outputs.loss.item()
+    
+    score = (nll_non_member - nll_member) / (original_nll + 1e-9)
+    return score
 
 
 @torch.no_grad()
@@ -147,14 +182,13 @@ def calculate_min_k_scores(logits_batch: torch.Tensor,
                          input_ids_batch: torch.Tensor, 
                          device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate min_k and min_k_plus scores efficiently."""
-    probs = F.softmax(logits_batch, dim=-1)
-    log_probs = F.log_softmax(logits_batch, dim=-1)
-    token_log_probs = log_probs.gather(dim=-1, index=input_ids_batch).squeeze(-1)
+    log_probs_all_vocab = F.log_softmax(logits_batch, dim=-1)
+    token_log_probs = log_probs_all_vocab.gather(dim=-1, index=input_ids_batch).squeeze(-1)
     
-    # Calculate mu and sigma efficiently
-    mu = (probs * log_probs).sum(-1)
-    sigma = (probs * torch.square(log_probs)).sum(-1) - torch.square(mu)
-    mink_plus = (token_log_probs - mu) / sigma.sqrt()
+    mu = log_probs_all_vocab.mean(dim=-1)
+    sigma = log_probs_all_vocab.std(dim=-1)
+    
+    mink_plus = (token_log_probs - mu) / sigma
     
     return token_log_probs.cpu().numpy(), mink_plus.cpu().numpy()
 
@@ -203,6 +237,43 @@ def calculate_high_confidence_scores(
     loss_adjusted_suffix = loss_adjusted_reshaped[:, -suffix_len:]
     
     return loss_adjusted_suffix.mean(1).cpu().numpy()
+
+
+@torch.no_grad()
+def calculate_lowercase_score(
+    generated_tokens: torch.Tensor,
+    original_nlls: torch.Tensor,
+    model,
+    tokenizer,
+    device: torch.device
+) -> np.ndarray:
+    """Calculate lowercase scores for a batch of generated sequences."""
+    decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    lowercase_texts = [text.lower() for text in decoded_texts]
+    
+    lowercase_inputs = tokenizer(
+        lowercase_texts,
+        return_tensors='pt',
+        padding=True,
+        truncation=True,
+        max_length=generated_tokens.shape[1]
+    ).to(device)
+    
+    lowercase_outputs = model(lowercase_inputs.input_ids, labels=lowercase_inputs.input_ids)
+    
+    lowercase_logits = lowercase_outputs.logits
+    shift_logits = lowercase_logits[..., :-1, :].contiguous()
+    shift_labels = lowercase_inputs.input_ids[..., 1:].contiguous()
+    
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    loss = loss.view(shift_labels.size())
+    
+    mask = (shift_labels != tokenizer.pad_token_id).float()
+    lowercase_nlls = (loss * mask).sum(dim=1)
+
+    scores = -original_nlls / (lowercase_nlls + 1e-9)
+    return scores.cpu().numpy()
 
 
 def write_guesses_to_csv(generations_per_prompt: int, 
@@ -257,21 +328,23 @@ def get_scoring_methods(k_ratios: List[float]) -> List[str]:
     """Get all available scoring methods."""
     base_methods = [
         "likelihood", "zlib", "metric", "high_confidence", 
-        "-recall", "recall2", "recall3", "recall_original"
+        "suffix_recall", "recall", "lowercase", "con_recall", "suffix_conrecall"
     ]
-    min_k_methods = [f"min_k_{ratio}" for ratio in k_ratios]
-    min_k_plus_methods = [f"min_k_plus_{ratio}" for ratio in k_ratios]
+    min_k_methods = [f"min_k_{r}" for r in k_ratios]
+    min_k_plus_methods = [f"min_k_plus_{r}" for r in k_ratios]
+    surprise_methods = [f"surprise_{r}" for r in k_ratios]
     
-    return base_methods + min_k_methods + min_k_plus_methods
+    return base_methods + min_k_methods + min_k_plus_methods + surprise_methods
 
 
 def get_argmin_methods() -> List[str]:
     """Get methods that use argmin for selection."""
-    return ["likelihood", "zlib", "metric", "high_confidence", "-recall", "recall2"]
+    return ["likelihood", "zlib", "metric", "high_confidence"]
 
 
 def get_argmax_methods(k_ratios: List[float]) -> List[str]:
     """Get methods that use argmax for selection."""
-    min_k_methods = [f"min_k_{ratio}" for ratio in k_ratios]
-    min_k_plus_methods = [f"min_k_plus_{ratio}" for ratio in k_ratios]
-    return ["recall3", "recall_original"] + min_k_methods + min_k_plus_methods
+    min_k_methods = [f"min_k_{r}" for r in k_ratios]
+    min_k_plus_methods = [f"min_k_plus_{r}" for r in k_ratios]
+    surprise_methods = [f"surprise_{r}" for r in k_ratios]
+    return ["suffix_recall", "recall", "lowercase", "con_recall", "suffix_conrecall"] + min_k_methods + min_k_plus_methods + surprise_methods

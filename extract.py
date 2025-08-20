@@ -9,6 +9,7 @@ import os
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pandas as pd
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -16,16 +17,18 @@ from tqdm import tqdm
 
 from utils import (
     init_seeds, load_model_and_tokenizer, load_prompts, write_array,
-    prepare_directories, calculate_likelihood_scores, calculate_recall_scores,
-    calculate_original_recall, calculate_min_k_scores, calculate_zlib_scores,
-    calculate_metric_scores, calculate_high_confidence_scores, write_guesses_to_csv,
-    calculate_metrics, get_scoring_methods, get_argmin_methods, get_argmax_methods
+    prepare_directories, calculate_recall_scores, calculate_suffix_con_recall,
+    calculate_recall, calculate_con_recall, calculate_min_k_scores, calculate_zlib_scores,
+    calculate_metric_scores, calculate_high_confidence_scores, calculate_lowercase_score,
+    write_guesses_to_csv, calculate_metrics, get_scoring_methods, 
+    get_argmin_methods, get_argmax_methods
 )
 
 # Constants
 SUFFIX_LEN = 50
 PREFIX_LEN = 50
 K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+MAX_ENTROPY = 2.0
 
 # Enable TF32 for faster computation on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -39,6 +42,7 @@ def generate_and_score(prompts: np.ndarray,
                       batch_size: int = 64,
                       skip_generation: bool = False,
                       non_member_prefix: np.ndarray = None,
+                      member_prefix: np.ndarray = None,
                       generation_params: Dict = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
     Generate text continuations and calculate all scoring metrics.
@@ -49,7 +53,8 @@ def generate_and_score(prompts: np.ndarray,
         tokenizer: Tokenizer
         batch_size: Batch size for processing
         skip_generation: If True, use prompts as generations (for evaluation)
-        non_member_prefix: Non-member prefixes for original recall calculation
+        non_member_prefix: Non-member prefixes for recall calculation
+        member_prefix: Member prefixes for con_recall calculation
         generation_params: Parameters for text generation
     
     Returns:
@@ -93,116 +98,110 @@ def generate_and_score(prompts: np.ndarray,
         outputs = model(generated_tokens, labels=generated_tokens)
         
         full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token = torch.nn.functional.cross_entropy(
-            full_logits, 
-            generated_tokens[:, 1:].flatten(), 
-            reduction='none'
-        )
+        full_loss_per_token_flat = F.cross_entropy(full_logits, generated_tokens[:, 1:].flatten(), reduction='none')
 
         high_conf_scores = calculate_high_confidence_scores(
-            outputs.logits[:, :-1],
-            full_loss_per_token,
-            SUFFIX_LEN
+            outputs.logits[:, :-1], full_loss_per_token_flat, SUFFIX_LEN
         )
         scores["high_confidence"].extend(high_conf_scores)
 
-        loss_per_token = full_loss_per_token.reshape(
-            -1, generated_tokens.shape[1] - 1
-        )[:, -SUFFIX_LEN:]
+        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -SUFFIX_LEN:]
         likelihood = loss_per_token.mean(1)
         scores["likelihood"].extend(likelihood.cpu().numpy())
         
-        zlib_scores = calculate_zlib_scores(generated_tokens, likelihood)
-        scores["zlib"].extend(zlib_scores)
+        scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
+        scores["metric"].extend(calculate_metric_scores(loss_per_token))
         
-        metric_scores = calculate_metric_scores(loss_per_token)
-        scores["metric"].extend(metric_scores)
+        # Calculate NLL for lowercase and con_recall
+        full_labels = generated_tokens[:, 1:].contiguous()
+        mask = (full_labels != tokenizer.pad_token_id).float()
+        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1)
         
-        # Calculate recall scores using ThreadPoolExecutor
+        scores["lowercase"].extend(calculate_lowercase_score(
+            generated_tokens, original_nlls, model, tokenizer, device
+        ))
+
+        # Calculate various recall scores using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=4) as executor:
-            recall_futures = []
-            original_recall_futures = []
+            futures = {
+                'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': []
+            }
             
             for batch_idx in range(generated_tokens.shape[0]):
-                input_tokens = input_ids[batch_idx]
-                suffix_tokens = generated_tokens[batch_idx, -SUFFIX_LEN:]
+                input_toks = input_ids[batch_idx]
+                suffix_toks = generated_tokens[batch_idx, -SUFFIX_LEN:]
                 
-                # Regular recall scores
-                recall_futures.append(
-                    executor.submit(
-                        calculate_recall_scores,
-                        input_tokens,
-                        suffix_tokens,
-                        model,
-                        device
-                    )
-                )
+                futures['suffix_recall'].append(executor.submit(
+                    calculate_recall_scores, input_toks, suffix_toks, model, device
+                ))
+                futures['suffix_conrecall'].append(executor.submit(
+                    calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device
+                ))
                 
-                # Original recall if non_member_prefix provided
                 if non_member_prefix is not None:
-                    non_member_prefix_tokens = torch.tensor(
-                        non_member_prefix[batch_idx % len(non_member_prefix)], 
-                        dtype=torch.int64, 
-                        device=device
-                    )
-                    original_recall_futures.append(
-                        executor.submit(
-                            calculate_original_recall,
-                            non_member_prefix_tokens,
-                            input_tokens,
-                            suffix_tokens,
-                            model,
-                            device
-                        )
-                    )
-            
-            # Process recall results
-            for batch_idx, future in enumerate(recall_futures):
-                ll_unconditional, ll_conditional = future.result()
-                ll_full = -likelihood[batch_idx].item()
-                
-                recall_score = ll_full / ll_unconditional if ll_unconditional != 0 else 0
-                recall2_score = ll_conditional / ll_unconditional if ll_unconditional != 0 else 0
-                
-                scores["-recall"].append(recall_score)
-                scores["recall2"].append(recall2_score)
-                scores["recall3"].append(recall2_score)
-            
-            # Process original recall results
-            if non_member_prefix is not None:
-                for future in original_recall_futures:
-                    ll_unconditional, ll_conditional = future.result()
-                    recall_score = ll_conditional / ll_unconditional if ll_unconditional != 0 else 0
-                    scores["recall_original"].append(recall_score)
-        
-        # Calculate min_k scores
+                    nm_prefix = torch.tensor(non_member_prefix[batch_idx % len(non_member_prefix)], dtype=torch.int64)
+                    futures['recall'].append(executor.submit(
+                        calculate_recall, nm_prefix, input_toks, suffix_toks, model, device
+                    ))
+                    
+                    if member_prefix is not None:
+                        m_prefix = torch.tensor(member_prefix[batch_idx % len(member_prefix)], dtype=torch.int64)
+                        futures['con_recall'].append(executor.submit(
+                            calculate_con_recall, nm_prefix, m_prefix,
+                            generated_tokens[batch_idx], original_nlls[batch_idx].item(),
+                            model, device
+                        ))
+
+            for ll_u, ll_c in [f.result() for f in futures['suffix_recall']]:
+                nll_unconditional = -ll_u
+                nll_conditional = -ll_c
+                scores["suffix_recall"].append(nll_unconditional / nll_conditional if nll_conditional != 0 else 0)
+            for score in [f.result() for f in futures['suffix_conrecall']]:
+                scores["suffix_conrecall"].append(score)
+            for nll_u, nll_c in [f.result() for f in futures['recall']]:
+                scores["recall"].append(nll_c / nll_u if nll_u != 0 else 0)
+            for score in [f.result() for f in futures['con_recall']]:
+                scores["con_recall"].append(score)
+
+        # Calculate min_k, min_k_plus, and surprise scores
         logits_batch = outputs.logits[:, :-1]
+        log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+        entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
+        
         input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
         token_log_probs, mink_plus = calculate_min_k_scores(logits_batch, input_ids_batch, device)
         
-        # Process min_k scores for each sequence
         for batch_idx in range(token_log_probs.shape[0]):
-            seq_token_log_probs = token_log_probs[batch_idx]
-            seq_mink_plus = mink_plus[batch_idx]
-            
-            # Only consider suffix part
-            suffix_token_log_probs = seq_token_log_probs[-SUFFIX_LEN:]
-            suffix_mink_plus = seq_mink_plus[-SUFFIX_LEN:]
+            seq_token_log_probs = token_log_probs[batch_idx][-SUFFIX_LEN:]
+            seq_mink_plus = mink_plus[batch_idx][-SUFFIX_LEN:]
+            seq_entropy = entropy_batch[batch_idx][-SUFFIX_LEN:]
             
             for ratio in K_RATIOS:
                 k_length = int(SUFFIX_LEN * ratio)
-                bottomk_mink = np.sort(suffix_token_log_probs)[:k_length]
-                bottomk_mink_plus = np.sort(suffix_mink_plus)[:k_length]
+                if k_length == 0: continue
                 
-                scores[f'min_k_{ratio}'].append(np.mean(bottomk_mink))
-                scores[f'min_k_plus_{ratio}'].append(np.mean(bottomk_mink_plus))
-        
+                scores[f'min_k_{ratio}'].append(np.mean(np.sort(seq_token_log_probs)[:k_length]))
+                scores[f'min_k_plus_{ratio}'].append(np.mean(np.sort(seq_mink_plus)[:k_length]))
+
+                mink_idx = np.argsort(seq_token_log_probs)[:k_length]
+                entropy_idx = np.where(seq_entropy.cpu().numpy() < MAX_ENTROPY)[0]
+                intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
+
+                surprise_score = np.mean(seq_token_log_probs[intersection]) if len(intersection) > 0 else -100.0
+                scores[f'surprise_{ratio}'].append(surprise_score)
+
         generations.extend(generated_tokens.cpu().numpy())
     
-    # Convert to numpy arrays
+    for ratio in K_RATIOS:
+        if int(SUFFIX_LEN * ratio) == 0:
+            num_missing = len(prompts) - len(scores[f'min_k_{ratio}'])
+            scores[f'min_k_{ratio}'].extend([0.0] * num_missing)
+            scores[f'min_k_plus_{ratio}'].extend([0.0] * num_missing)
+            scores[f'surprise_{ratio}'].extend([0.0] * num_missing)
+
     generations = np.array(generations)
     for method in scoring_methods:
-        if scores[method]:  # Only convert non-empty lists
+        if scores[method]:
             scores[method] = np.array(scores[method])
     
     return generations, scores
@@ -212,27 +211,27 @@ def run_extraction(args):
     """Main extraction pipeline."""
     print(f"Starting extraction with {args.model}")
     
-    # Initialize
     init_seeds(args.seed)
     model, tokenizer = load_model_and_tokenizer(args.model)
     
-    # Prepare directories
     experiment_base, generations_base, losses_base = prepare_directories(
         args.root_dir, args.experiment_name
     )
     
-    # Load data
     prompts = load_prompts(args.dataset_dir, "train_prefix.npy")[-args.val_set_num:]
     
-    # Load non-member prefix if available
-    non_member_prefix = None
+    non_member_prefix, member_prefix = None, None
     try:
         non_member_prefix = load_prompts(args.dataset_dir, "non_member_prefix.npy", allow_pickle=True)
-        print("Loaded non-member prefix for original recall calculation")
+        print("Loaded non-member prefix for recall calculation.")
     except FileNotFoundError:
-        print("Warning: non_member_prefix.npy not found. Original recall will not be calculated.")
-    
-    # Generation parameters
+        print("Warning: non_member_prefix.npy not found. `recall` and `con_recall` will not be calculated.")
+    try:
+        member_prefix = load_prompts(args.dataset_dir, "member_prefix.npy", allow_pickle=True)
+        print("Loaded member prefix for con_recall calculation.")
+    except FileNotFoundError:
+        print("Warning: member_prefix.npy not found. `con_recall` will not be calculated.")
+
     generation_params = {
         'max_length': SUFFIX_LEN + PREFIX_LEN,
         'do_sample': True,
@@ -240,7 +239,7 @@ def run_extraction(args):
         'top_p': args.top_p,
         'temperature': args.temperature,
         'repetition_penalty': args.repetition_penalty,
-        'pad_token_id': 50256,
+        'pad_token_id': tokenizer.pad_token_id,
         'use_cache': True
     }
     
@@ -248,7 +247,6 @@ def run_extraction(args):
     all_generations = []
     all_scores = {method: [] for method in scoring_methods}
     
-    # Generate and score for multiple trials
     for trial in range(args.num_trials):
         print(f'Trial {trial + 1}/{args.num_trials}...')
         
@@ -258,46 +256,41 @@ def run_extraction(args):
             tokenizer=tokenizer,
             batch_size=args.batch_size,
             non_member_prefix=non_member_prefix,
+            member_prefix=member_prefix,
             generation_params=generation_params
         )
         
         if args.save_npy_files:
-            generation_path = os.path.join(generations_base, "{}.npy")
-            write_array(generation_path, generations, trial)
+            write_array(os.path.join(generations_base, "{}.npy"), generations, trial)
             for method in scoring_methods:
-                if len(scores[method]) > 0:
-                    losses_path = os.path.join(losses_base, f"{method}_{{}}.npy")
-                    write_array(losses_path, scores[method], trial)
+                if len(scores.get(method, [])) > 0:
+                    write_array(os.path.join(losses_base, f"{method}_{{}}.npy"), scores[method], trial)
         
         for method in scoring_methods:
-            if len(scores[method]) > 0:
+            if len(scores.get(method, [])) > 0:
                 all_scores[method].append(scores[method])
         
         all_generations.append(generations)
     
-    # Stack results
     all_generations = np.stack(all_generations, axis=1)
     for method in scoring_methods:
-        if all_scores[method]:
+        if all_scores.get(method):
             all_scores[method] = np.stack(all_scores[method], axis=1)
     
     print(f"Generated shape: {all_generations.shape}")
     
-    # Load ground truth for evaluation
     answers = load_prompts(args.dataset_dir, "train_dataset.npy")[-args.val_set_num:, -100:]
 
     max_generations_per_prompt = all_generations.shape[1]
+    gen_tiers = [1, 5, 10, 20, 50, max_generations_per_prompt]
+    
     if args.save_all_generations_per_prompt:
-        generations_to_process = [1, 5, 10, 20, 50, max_generations_per_prompt]
-        generations_to_process = [g for g in generations_to_process if g <= max_generations_per_prompt]
+        generations_to_process = [g for g in gen_tiers if g <= max_generations_per_prompt]
     else:
         generations_to_process = [max_generations_per_prompt]
 
     all_metrics_data = []
-    
-    # Always process all generation tiers for the final summary CSV
-    full_generations_tiers = [1, 5, 10, 20, 50, max_generations_per_prompt]
-    full_generations_tiers = sorted(list(set([g for g in full_generations_tiers if g <= max_generations_per_prompt])))
+    full_generations_tiers = sorted(list(set([g for g in gen_tiers if g <= max_generations_per_prompt])))
     
     for generations_per_prompt in full_generations_tiers:
         print(f"\nCalculating metrics for {generations_per_prompt} generations per prompt...")
@@ -305,28 +298,20 @@ def run_extraction(args):
         limited_generations = all_generations[:, :generations_per_prompt, :]
         generations_dict = {}
         
-        valid_methods = [method for method in scoring_methods if len(all_scores[method]) > 0]
+        valid_methods = [m for m in scoring_methods if all_scores.get(m) is not None and len(all_scores[m]) > 0]
         argmin_methods = get_argmin_methods()
         argmax_methods = get_argmax_methods(K_RATIOS)
         
         for method in valid_methods:
             limited_scores = all_scores[method][:, :generations_per_prompt]
             
-            if method in argmin_methods:
-                best_indices = limited_scores.argmin(axis=1)
-            else:
-                best_indices = limited_scores.argmax(axis=1)
+            best_indices = limited_scores.argmin(axis=1) if method in argmin_methods else limited_scores.argmax(axis=1)
             
             prompt_indices = np.arange(limited_generations.shape[0])
             generations_dict[method] = limited_generations[prompt_indices, best_indices, :]
         
-        # Decide which guess files to write based on flags
         if generations_per_prompt in generations_to_process:
-            if args.save_all_methods:
-                methods_to_save_csv = valid_methods
-            else:
-                methods_to_save_csv = ["likelihood"] if "likelihood" in valid_methods else []
-            
+            methods_to_save_csv = valid_methods if args.save_all_methods else (["likelihood"] if "likelihood" in valid_methods else [])
             if methods_to_save_csv:
                 write_guesses_to_csv(generations_per_prompt, generations_dict, answers, methods_to_save_csv)
         
@@ -335,8 +320,7 @@ def run_extraction(args):
             all_metrics_data.append({
                 'generations_per_prompt': generations_per_prompt,
                 'method': method,
-                'precision': method_metrics['precision'],
-                'hamming_distance': method_metrics['hamming_distance']
+                **method_metrics
             })
 
     df_metrics = pd.DataFrame(all_metrics_data)
@@ -345,8 +329,7 @@ def run_extraction(args):
         df_metrics.to_csv(results_csv_path, index=False, float_format='%.4f')
         print(f"\nExtraction metrics summary saved to {results_csv_path}")
 
-    print(f"\nResults for {max_generations_per_prompt} generations per prompt:")
-    if not df_metrics.empty:
+        print(f"\nResults for {max_generations_per_prompt} generations per prompt:")
         max_n_metrics = df_metrics[df_metrics['generations_per_prompt'] == max_generations_per_prompt]
         if not max_n_metrics.empty:
             print(max_n_metrics.to_string(index=False))

@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 import zlib
 
-from utils import load_model_and_tokenizer, get_scoring_methods
+from utils import load_model_and_tokenizer, get_scoring_methods, calculate_suffix_con_recall
 
 # Constants matching extract.py
 K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -72,20 +72,26 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         ).squeeze(-1)
         ll_conditional = full_token_log_probs.mean().item()
         
-        # Calculate recall scores
-        recall_score = ll_conditional - ll_unconditional if ll_unconditional != 0 else 0
-        scores['-recall'].append(recall_score)
-        scores['recall2'].append(recall_score)
-        scores['recall3'].append(recall_score)
+        # Calculate suffix_recall score using the new formula
+        nll_unconditional = -ll_unconditional
+        nll_conditional = -ll_conditional
+        suffix_recall_score = nll_unconditional / nll_conditional if nll_conditional != 0 else 0
+        scores['suffix_recall'].append(suffix_recall_score)
         
+        # Calculate suffix_con_recall score
+        s_con_recall_score = calculate_suffix_con_recall(
+            prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, tokenizer, device
+        )
+        scores['suffix_conrecall'].append(s_con_recall_score)
+
         # Calculate other scores using the full sequence
         outputs = model(full_ids, labels=full_ids)
         loss, logits = outputs[:2]
         
         # 1. Likelihood - keep original scale (log likelihood)
-        log_probs = F.log_softmax(logits[0, :-1], dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
-        ll = token_log_probs.mean().item()
+        log_probs_full = F.log_softmax(logits[0, :-1], dim=-1)
+        token_log_probs_full = log_probs_full.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+        ll = token_log_probs_full.mean().item()
         scores['likelihood'].append(ll)
         
         # 2. Zlib
@@ -119,32 +125,60 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         conf_loss = loss_per_token - conf_adjustment.cpu().numpy()
         scores['high_confidence'].append(-np.mean(conf_loss))
         
-        # 5. Min-k and Min-k++ scores
-        probs = F.softmax(logits[0, :-1], dim=-1)
-        log_probs = F.log_softmax(logits[0, :-1], dim=-1)
+        # 5. Min-k, Min-k++, and Surprise scores
+        logits_shifted = logits[0, :-1]
+        log_probs = F.log_softmax(logits_shifted, dim=-1)
         token_log_probs = log_probs.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
-        mu = (probs * log_probs).sum(-1)
-        sigma = (probs * torch.square(log_probs)).sum(-1) - torch.square(mu)
         
-        # Min-k scores
+        mu = log_probs.mean(-1)
+        sigma = log_probs.std(-1)
+        mink_plus = (token_log_probs - mu) / sigma
+        
+        entropy = (-torch.exp(log_probs) * log_probs).sum(dim=-1)
+        
         for ratio in K_RATIOS:
             k_length = int(len(token_log_probs) * ratio)
             if k_length > 0:
-                topk = np.sort(token_log_probs.cpu())[:k_length]
-                scores[f'min_k_{ratio}'].append(-np.mean(topk).item())
+                # Min-k
+                topk_mink = np.sort(token_log_probs.cpu())[:k_length]
+                scores[f'min_k_{ratio}'].append(-np.mean(topk_mink).item())
+                
+                # Min-k++
+                topk_mink_plus = np.sort(mink_plus.cpu())[:k_length]
+                scores[f'min_k_plus_{ratio}'].append(-np.mean(topk_mink_plus).item())
+
+                # Surprise
+                mink_idx = np.argsort(token_log_probs.cpu().numpy())[:k_length]
+                entropy_idx = np.where(entropy.cpu().numpy() < 2.0)[0]
+                intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
+                
+                if len(intersection) > 0:
+                    score = np.mean(token_log_probs.cpu().numpy()[intersection])
+                else:
+                    score = -100.0
+                scores[f'surprise_{ratio}'].append(score)
+
             else:
                 scores[f'min_k_{ratio}'].append(0.0)
-        
-        # Min-k++ scores
-        mink_plus = (token_log_probs - mu) / sigma.sqrt()
-        for ratio in K_RATIOS:
-            k_length = int(len(mink_plus) * ratio)
-            if k_length > 0:
-                topk = np.sort(mink_plus.cpu())[:k_length]
-                scores[f'min_k_plus_{ratio}'].append(-np.mean(topk).item())
-            else:
                 scores[f'min_k_plus_{ratio}'].append(0.0)
-    
+                scores[f'surprise_{ratio}'].append(0.0)
+        
+        # 6. Lowercase score
+        original_nll = F.cross_entropy(logits[0, :-1], full_ids[0, 1:], reduction='sum').item()
+        
+        decoded_text = tokenizer.decode(full_ids[0].cpu().numpy(), skip_special_tokens=True)
+        lowercase_text = decoded_text.lower()
+        lowercase_ids = tokenizer(lowercase_text, return_tensors='pt').input_ids.to(device)
+        
+        if lowercase_ids.shape[1] > 1:
+            lowercase_outputs = model(lowercase_ids, labels=lowercase_ids)
+            lowercase_logits = lowercase_outputs.logits
+            lowercase_nll = F.cross_entropy(lowercase_logits[0, :-1], lowercase_ids[0, 1:], reduction='sum').item()
+            lowercase_score = -original_nll / (lowercase_nll + 1e-9)
+        else:
+            lowercase_score = 0
+        scores['lowercase'].append(lowercase_score)
+
     return scores
 
 
@@ -241,10 +275,14 @@ def run_mia_evaluation(args):
             if method not in scores or len(scores[method]) == 0:
                 continue
                 
-            # For methods that use argmax in extract.py, invert the scores
-            argmax_methods = ["recall3"] + [f"min_k_{ratio}" for ratio in K_RATIOS] + [f"min_k_plus_{ratio}" for ratio in K_RATIOS]
+            # For MIA, higher score should always indicate membership.
+            # Some calculated scores are losses (lower is better), so we invert them.
+            lower_is_better_methods = (
+                [f"min_k_{r}" for r in K_RATIOS] + 
+                [f"min_k_plus_{r}" for r in K_RATIOS]
+            )
             
-            if method in argmax_methods:
+            if method in lower_is_better_methods:
                 method_scores = [-s for s in scores[method]]
             else:
                 method_scores = scores[method]
