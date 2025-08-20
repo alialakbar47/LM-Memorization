@@ -373,7 +373,7 @@ def main():
                        help='Top-p for generation')
     parser.add_argument('--temperature', type=float, default=1.0,
                        help='Temperature for generation')
-    parser.add_argument('--typical', type=float, default=1.0,
+    parser.add_argument('--typical_p', type=float, default=1.0,
                        help='Typical p for generation for generation')
     parser.add_argument('--repetition_penalty', type=float, default=1.0,
                        help='Repetition penalty for generation')
