@@ -240,7 +240,7 @@ def run_extraction(args):
         'top_k': args.top_k,
         'top_p': args.top_p,
         'temperature': args.temperature,
-        'typical_p':args.typical,
+        'typical_p':args.typical_p,
         'repetition_penalty': args.repetition_penalty,
         'pad_token_id': tokenizer.pad_token_id,
         'use_cache': True
