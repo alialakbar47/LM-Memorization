@@ -116,6 +116,7 @@ def main():
             "--batch_size", str(args.batch_size),
             "--top_k", str(args.top_k),
             "--top_p", str(args.top_p),
+            "--typical_p", str(args.typical),
             "--temperature", str(args.temperature),
             "--repetition_penalty", str(args.repetition_penalty),
             "--seed", str(args.seed)
