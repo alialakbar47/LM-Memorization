@@ -238,6 +238,7 @@ def run_extraction(args):
         'top_k': args.top_k,
         'top_p': args.top_p,
         'temperature': args.temperature,
+        'typical_p':args.typical,
         'repetition_penalty': args.repetition_penalty,
         'pad_token_id': tokenizer.pad_token_id,
         'use_cache': True
@@ -369,6 +370,8 @@ def main():
                        help='Top-p for generation')
     parser.add_argument('--temperature', type=float, default=0.58,
                        help='Temperature for generation')
+    parser.add_argument('--typical', type=float, default=0.9,
+                       help='Typical p for generation for generation')
     parser.add_argument('--repetition_penalty', type=float, default=1.04,
                        help='Repetition penalty for generation')
     

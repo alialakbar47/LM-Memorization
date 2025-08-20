@@ -144,11 +144,16 @@ def calculate_recall(non_member_prefix_tokens: torch.Tensor,
     Calculate recall score based on NLL ratio, matching the provided recall.py logic.
     Returns (unconditional_nll, conditional_nll).
     """
-    full_sequence = torch.cat((input_tokens, suffix_tokens)).to(device)
+    # [FIXED] Ensure all tensors are on the same device before concatenation.
+    non_member_prefix_tokens = non_member_prefix_tokens.to(device)
+    input_tokens = input_tokens.to(device)
+    suffix_tokens = suffix_tokens.to(device)
+
+    full_sequence = torch.cat((input_tokens, suffix_tokens))
     outputs = model(full_sequence.unsqueeze(0), labels=full_sequence.unsqueeze(0))
     nll_unconditional = outputs.loss.item()
     
-    full_sequence_with_prefix = torch.cat((non_member_prefix_tokens, input_tokens, suffix_tokens)).to(device)
+    full_sequence_with_prefix = torch.cat((non_member_prefix_tokens, input_tokens, suffix_tokens))
     outputs_with_prefix = model(full_sequence_with_prefix.unsqueeze(0), labels=full_sequence_with_prefix.unsqueeze(0))
     nll_conditional = outputs_with_prefix.loss.item()
     
@@ -165,11 +170,16 @@ def calculate_con_recall(
     device: torch.device
 ) -> float:
     """Calculate contrastive recall score."""
-    nm_prefixed_sequence = torch.cat((non_member_prefix_tokens, full_sequence_tokens)).to(device)
+    # [FIXED] Ensure all tensors are on the same device before concatenation.
+    non_member_prefix_tokens = non_member_prefix_tokens.to(device)
+    member_prefix_tokens = member_prefix_tokens.to(device)
+    full_sequence_tokens = full_sequence_tokens.to(device)
+
+    nm_prefixed_sequence = torch.cat((non_member_prefix_tokens, full_sequence_tokens))
     nm_outputs = model(nm_prefixed_sequence.unsqueeze(0), labels=nm_prefixed_sequence.unsqueeze(0))
     nll_non_member = nm_outputs.loss.item()
     
-    m_prefixed_sequence = torch.cat((member_prefix_tokens, full_sequence_tokens)).to(device)
+    m_prefixed_sequence = torch.cat((member_prefix_tokens, full_sequence_tokens))
     m_outputs = model(m_prefixed_sequence.unsqueeze(0), labels=m_prefixed_sequence.unsqueeze(0))
     nll_member = m_outputs.loss.item()
     
