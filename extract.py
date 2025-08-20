@@ -1,3 +1,5 @@
+--- START OF FILE extract.py ---
+
 """
 LLM Data Extraction with Multiple Scoring Methods.
 
@@ -64,11 +66,11 @@ def generate_and_score(prompts: np.ndarray,
         generation_params = {
             'max_length': SUFFIX_LEN + PREFIX_LEN,
             'do_sample': True,
-            'top_k': 24,
-            'top_p': 0.8,
-            'typical_p': 0.9,
-            'temperature': 0.58,
-            'repetition_penalty': 1.04,
+            'top_k': 10, # MODIFIED: Changed fallback default to match new baseline
+            'top_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
+            'typical_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
+            'temperature': 1.0, # MODIFIED: Changed fallback default to match new baseline
+            'repetition_penalty': 1.0, # MODIFIED: Changed fallback default to match new baseline
             'pad_token_id': 50256,
             'use_cache': True
         }
@@ -364,15 +366,16 @@ def main():
                        help='Batch size for processing')
     
     # Generation parameters
-    parser.add_argument('--top_k', type=int, default=24,
+    # MODIFIED: Changed all defaults to new baseline
+    parser.add_argument('--top_k', type=int, default=10,
                        help='Top-k for generation')
-    parser.add_argument('--top_p', type=float, default=0.8,
+    parser.add_argument('--top_p', type=float, default=1.0,
                        help='Top-p for generation')
-    parser.add_argument('--temperature', type=float, default=0.58,
+    parser.add_argument('--temperature', type=float, default=1.0,
                        help='Temperature for generation')
-    parser.add_argument('--typical', type=float, default=0.9,
+    parser.add_argument('--typical', type=float, default=1.0,
                        help='Typical p for generation for generation')
-    parser.add_argument('--repetition_penalty', type=float, default=1.04,
+    parser.add_argument('--repetition_penalty', type=float, default=1.0,
                        help='Repetition penalty for generation')
     
     # Saving arguments
