@@ -62,16 +62,16 @@ def main():
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size for processing')
     
-    # Generation parameters
-    parser.add_argument('--top_k', type=int, default=24,
+    parser.add_argument('--top_k', type=int, default=50,
                        help='Top-k for generation')
-    parser.add_argument('--top_p', type=float, default=0.8,
+    parser.add_argument('--top_p', type=float, default=1.0,
                        help='Top-p for generation')
-    parser.add_argument('--temperature', type=float, default=0.58,
+    parser.add_argument('--temperature', type=float, default=1.0,
                        help='Temperature for generation')
-    parser.add_argument('--repetition_penalty', type=float, default=1.04,
+    parser.add_argument('--typical', type=float, default=1.0,
+                       help='Typical p for generation for generation')
+    parser.add_argument('--repetition_penalty', type=float, default=1.0,
                        help='Repetition penalty for generation')
-    
     # Saving arguments
     parser.add_argument('--save_all_generations_per_prompt', action='store_true',
                        help='Save guess CSVs for all generation count tiers (1, 5, 10, etc.)')

@@ -367,7 +367,7 @@ def main():
     
     # Generation parameters
     # MODIFIED: Changed all defaults to new baseline
-    parser.add_argument('--top_k', type=int, default=10,
+    parser.add_argument('--top_k', type=int, default=50,
                        help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0,
                        help='Top-p for generation')
