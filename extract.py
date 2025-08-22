@@ -114,11 +114,10 @@ def generate_and_score(prompts: np.ndarray,
         scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
         scores["metric"].extend(calculate_metric_scores(loss_per_token))
         
-        # Calculate NLL for lowercase and con_recall
+        # Calculate normalized NLL for lowercase and con_recall
         full_labels = generated_tokens[:, 1:].contiguous()
         mask = (full_labels != tokenizer.pad_token_id).float()
-        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1)
-        
+        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
         scores["lowercase"].extend(calculate_lowercase_score(
             generated_tokens, original_nlls, model, tokenizer, device
         ))
@@ -137,7 +136,8 @@ def generate_and_score(prompts: np.ndarray,
                     calculate_recall_scores, input_toks, suffix_toks, model, device
                 ))
                 futures['suffix_conrecall'].append(executor.submit(
-                    calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device
+                 calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
+                 non_member_prefix, off + batch_idx  # Add non_member_prefix and example_id
                 ))
                 
                 if non_member_prefix is not None:
@@ -240,7 +240,7 @@ def run_extraction(args):
         'top_k': args.top_k,
         'top_p': args.top_p,
         'temperature': args.temperature,
-        'typical_p':args.typical,
+        'typical_p':args.typical_p,
         'repetition_penalty': args.repetition_penalty,
         'pad_token_id': tokenizer.pad_token_id,
         'use_cache': True

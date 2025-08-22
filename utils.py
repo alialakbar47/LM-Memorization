@@ -124,15 +124,78 @@ def calculate_recall_scores(prefix_tokens: torch.Tensor, suffix_tokens: torch.Te
 
 @torch.no_grad()
 def calculate_suffix_con_recall(prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor,
-                               model, tokenizer, device: torch.device) -> float:
-    """Calculate suffix-based contrastive recall."""
-    ll_unconditional = get_ll(model, suffix_tokens, device)
-    ll_cond_member = get_cond_ll(model, prefix_tokens, suffix_tokens, device)
+                               model, tokenizer, device: torch.device,
+                               non_member_prefix_pool: torch.Tensor = None,
+                               example_id: int = 0) -> float:
+    """
+    Calculate suffix-based contrastive recall using non-member prefix data.
     
-    perturbed_prefix = perturb_prefix(prefix_tokens, tokenizer.vocab_size)
-    ll_cond_non_member = get_cond_ll(model, perturbed_prefix, suffix_tokens, device)
+    This mirrors con_recall but studies the suffix instead of (prefix + suffix).
+    Instead of member vs non-member full sequences, we compare:
+    - suffix conditioned on original prefix (member context)
+    - suffix conditioned on non-member prefix (non-member context)
     
-    return (ll_cond_member - ll_cond_non_member) / (abs(ll_unconditional) + 1e-9)
+    Formula: (nll_non_member - nll_member) / (original_nll + 1e-9)
+    where:
+    - nll_member = NLL of suffix conditioned on original prefix
+    - nll_non_member = NLL of suffix conditioned on non-member prefix
+    - original_nll = NLL of suffix alone (unconditional)
+    """
+    # [FIXED] Ensure tensors are on correct device
+    prefix_tokens = prefix_tokens.to(device)
+    suffix_tokens = suffix_tokens.to(device)
+    
+    # Calculate unconditional NLL of suffix (for normalization)
+    suffix_outputs = model(suffix_tokens.unsqueeze(0), labels=suffix_tokens.unsqueeze(0))
+    original_nll = suffix_outputs.loss.item()
+    
+    # Get non-member prefix from the pool
+    if non_member_prefix_pool is not None:
+        # Deterministic selection based on example_id to ensure reproducibility
+        pool_idx = example_id % len(non_member_prefix_pool)
+        selected_non_member = torch.tensor(non_member_prefix_pool[pool_idx], dtype=torch.int64, device=device)
+        
+        # Adjust length to match original prefix
+        target_length = len(prefix_tokens)
+        if len(selected_non_member) == target_length:
+            non_member_prefix = selected_non_member
+        elif len(selected_non_member) > target_length:
+            # Truncate to match length
+            non_member_prefix = selected_non_member[:target_length]
+        else:
+            # Repeat pattern to reach target length
+            repeats_needed = (target_length + len(selected_non_member) - 1) // len(selected_non_member)
+            repeated = selected_non_member.repeat(repeats_needed)
+            non_member_prefix = repeated[:target_length]
+    else:
+        # Fallback to simple perturbation if no pool provided
+        non_member_prefix = (prefix_tokens + 1000) % tokenizer.vocab_size
+    
+    # Calculate conditional NLLs using the same approach as con_recall
+    
+    # 1. NLL of suffix conditioned on original prefix (member context)
+    member_sequence = torch.cat([prefix_tokens, suffix_tokens])
+    member_outputs = model(member_sequence.unsqueeze(0), labels=member_sequence.unsqueeze(0))
+    
+    # Extract loss for suffix portion only
+    prefix_len = len(prefix_tokens)
+    member_logits = member_outputs.logits[0, prefix_len-1:-1]  # Logits for suffix tokens
+    member_loss = F.cross_entropy(member_logits, suffix_tokens, reduction='mean')
+    nll_member = member_loss.item()
+    
+    # 2. NLL of suffix conditioned on non-member prefix (non-member context)
+    non_member_sequence = torch.cat([non_member_prefix, suffix_tokens])
+    non_member_outputs = model(non_member_sequence.unsqueeze(0), labels=non_member_sequence.unsqueeze(0))
+    
+    # Extract loss for suffix portion only
+    non_member_logits = non_member_outputs.logits[0, prefix_len-1:-1]  # Logits for suffix tokens
+    non_member_loss = F.cross_entropy(non_member_logits, suffix_tokens, reduction='mean')
+    nll_non_member = non_member_loss.item()
+    
+    # Use same mathematical formula as con_recall
+    # Score = (nll_non_member - nll_member) / (original_nll + 1e-9)
+    score = (nll_non_member - nll_member) / (original_nll + 1e-9)
+    return score
 
 
 @torch.no_grad()
@@ -257,7 +320,7 @@ def calculate_lowercase_score(
     tokenizer,
     device: torch.device
 ) -> np.ndarray:
-    """Calculate lowercase scores for a batch of generated sequences."""
+    """Calculate lowercase scores for a batch of generated sequences, normalized per token."""
     decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     lowercase_texts = [text.lower() for text in decoded_texts]
     
@@ -280,7 +343,7 @@ def calculate_lowercase_score(
     loss = loss.view(shift_labels.size())
     
     mask = (shift_labels != tokenizer.pad_token_id).float()
-    lowercase_nlls = (loss * mask).sum(dim=1)
+    lowercase_nlls = (loss * mask).sum(dim=1) / mask.sum(dim=1)
 
     scores = -original_nlls / (lowercase_nlls + 1e-9)
     return scores.cpu().numpy()
