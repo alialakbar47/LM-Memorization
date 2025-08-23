@@ -136,8 +136,8 @@ def generate_and_score(prompts: np.ndarray,
                     calculate_recall_scores, input_toks, suffix_toks, model, device
                 ))
                 futures['suffix_conrecall'].append(executor.submit(
-                 calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
-                 non_member_prefix, off + batch_idx  # Add non_member_prefix and example_id
+                calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
+                non_member_prefix, off + batch_idx  # Add non_member_prefix and example_id
                 ))
                 
                 if non_member_prefix is not None:

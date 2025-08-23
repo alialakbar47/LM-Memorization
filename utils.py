@@ -121,7 +121,6 @@ def calculate_recall_scores(prefix_tokens: torch.Tensor, suffix_tokens: torch.Te
     ll_conditional = get_cond_ll(model, prefix_tokens, suffix_tokens, device)
     return ll_unconditional, ll_conditional
 
-
 @torch.no_grad()
 def calculate_suffix_con_recall(prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor,
                                model, tokenizer, device: torch.device,
@@ -320,7 +319,7 @@ def calculate_lowercase_score(
     tokenizer,
     device: torch.device
 ) -> np.ndarray:
-    """Calculate lowercase scores for a batch of generated sequences, normalized per token."""
+    """Calculate lowercase scores for a batch of generated sequences."""
     decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
     lowercase_texts = [text.lower() for text in decoded_texts]
     
@@ -343,8 +342,11 @@ def calculate_lowercase_score(
     loss = loss.view(shift_labels.size())
     
     mask = (shift_labels != tokenizer.pad_token_id).float()
-    lowercase_nlls = (loss * mask).sum(dim=1) / mask.sum(dim=1)
+    lowercase_nlls = (loss * mask).sum(dim=1)
 
+    # FIXED: Match the main+lowercase implementation exactly
+    # Both original_nlls and lowercase_nlls are NLLs (from CrossEntropyLoss)  
+    # Score = -original_nll / (lowercase_nll + 1e-9) to match lowercase.py
     scores = -original_nlls / (lowercase_nlls + 1e-9)
     return scores.cpu().numpy()
 
