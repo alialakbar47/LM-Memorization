@@ -1,5 +1,3 @@
-
-
 """
 LLM Data Extraction with Multiple Scoring Methods.
 
@@ -48,31 +46,12 @@ def generate_and_score(prompts: np.ndarray,
                       generation_params: Dict = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
     Generate text continuations and calculate all scoring metrics.
-    
-    Args:
-        prompts: Input prompts for generation
-        model: Language model
-        tokenizer: Tokenizer
-        batch_size: Batch size for processing
-        skip_generation: If True, use prompts as generations (for evaluation)
-        non_member_prefix: Non-member prefixes for recall calculation
-        member_prefix: Member prefixes for con_recall calculation
-        generation_params: Parameters for text generation
-    
-    Returns:
-        Tuple of (generations, scores_dict)
     """
     if generation_params is None:
         generation_params = {
-            'max_length': SUFFIX_LEN + PREFIX_LEN,
-            'do_sample': True,
-            'top_k': 10, # MODIFIED: Changed fallback default to match new baseline
-            'top_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'typical_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'temperature': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'repetition_penalty': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'pad_token_id': 50256,
-            'use_cache': True
+            'max_length': SUFFIX_LEN + PREFIX_LEN, 'do_sample': True, 'top_k': 50,
+            'top_p': 1.0, 'typical_p': 1.0, 'temperature': 1.0,
+            'repetition_penalty': 1.0, 'pad_token_id': tokenizer.pad_token_id, 'use_cache': True
         }
     
     device = next(model.parameters()).device
@@ -80,15 +59,18 @@ def generate_and_score(prompts: np.ndarray,
     generations = []
     scores = {method: [] for method in scoring_methods}
     
-    # Process prompts in batches
     for off in tqdm(range(0, len(prompts), batch_size), desc="Processing batches"):
         prompt_batch = prompts[off:off + batch_size]
         prompt_batch = np.stack(prompt_batch, axis=0)
         input_ids = torch.tensor(prompt_batch, dtype=torch.int64, device=device)
         
         if not skip_generation:
-            # Generate text continuations
-            generated_tokens = model.generate(
+            # Handle DataParallel wrapper for .generate() method
+            generate_func = model.generate
+            if isinstance(model, torch.nn.DataParallel):
+                generate_func = model.module.generate
+
+            generated_tokens = generate_func(
                 input_ids,
                 attention_mask=torch.ones_like(input_ids),
                 **generation_params
@@ -96,7 +78,7 @@ def generate_and_score(prompts: np.ndarray,
         else:
             generated_tokens = input_ids
         
-        # Forward pass for scoring
+        # Forward pass for scoring (DataParallel handles this automatically)
         outputs = model(generated_tokens, labels=generated_tokens)
         
         full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
@@ -114,7 +96,6 @@ def generate_and_score(prompts: np.ndarray,
         scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
         scores["metric"].extend(calculate_metric_scores(loss_per_token))
         
-        # Calculate normalized NLL for lowercase and con_recall
         full_labels = generated_tokens[:, 1:].contiguous()
         mask = (full_labels != tokenizer.pad_token_id).float()
         original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
@@ -122,7 +103,6 @@ def generate_and_score(prompts: np.ndarray,
             generated_tokens, original_nlls, model, tokenizer, device
         ))
 
-        # Calculate various recall scores using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': []
@@ -137,7 +117,7 @@ def generate_and_score(prompts: np.ndarray,
                 ))
                 futures['suffix_conrecall'].append(executor.submit(
                 calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
-                non_member_prefix, off + batch_idx  # Add non_member_prefix and example_id
+                non_member_prefix, off + batch_idx
                 ))
                 
                 if non_member_prefix is not None:
@@ -165,7 +145,6 @@ def generate_and_score(prompts: np.ndarray,
             for score in [f.result() for f in futures['con_recall']]:
                 scores["con_recall"].append(score)
 
-        # Calculate min_k, min_k_plus, and surprise scores
         logits_batch = outputs.logits[:, :-1]
         log_probs_batch = F.log_softmax(logits_batch, dim=-1)
         entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
@@ -366,7 +345,6 @@ def main():
                        help='Batch size for processing')
     
     # Generation parameters
-    # MODIFIED: Changed all defaults to new baseline
     parser.add_argument('--top_k', type=int, default=50,
                        help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0,

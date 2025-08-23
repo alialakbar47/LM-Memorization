@@ -36,6 +36,9 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
     """Calculate scores for MIA evaluation."""
     scores = defaultdict(list)
     
+    # When using DataParallel, the device for tensors should be the primary GPU
+    primary_device = next(model.parameters()).device
+
     for _, row in tqdm(df.iterrows(), total=len(df), desc='Calculating scores'):
         guess = np.array(row['Suffix Guess'])
         ground_truth = np.array(row['Ground Truth'])
@@ -45,9 +48,9 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         suffix = guess[50:]
         
         # Convert to tensors
-        prefix_ids = torch.tensor(prefix, dtype=torch.int64).unsqueeze(0).to(device)
-        suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(device)
-        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        prefix_ids = torch.tensor(prefix, dtype=torch.int64).unsqueeze(0).to(primary_device)
+        suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(primary_device)
+        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(primary_device)
         
         # Calculate recall scores (using prefix-suffix split)
         # Unconditional: probability of suffix
@@ -65,7 +68,7 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         full_logits = full_outputs.logits[:, :-1]
         full_log_probs = F.log_softmax(full_logits, dim=-1)
         # Only gather probabilities for suffix positions
-        suffix_positions = torch.arange(50, len(guess)-1, device=device)
+        suffix_positions = torch.arange(50, len(guess)-1, device=primary_device)
         full_token_log_probs = full_log_probs[0, suffix_positions].gather(
             dim=-1,
             index=suffix_ids[0, 1:].unsqueeze(-1)
@@ -80,7 +83,7 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         
         # Calculate suffix_con_recall score
         s_con_recall_score = calculate_suffix_con_recall(
-            prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, tokenizer, device
+            prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, tokenizer, primary_device
         )
         scores['suffix_conrecall'].append(s_con_recall_score)
 
@@ -168,7 +171,7 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         
         decoded_text = tokenizer.decode(full_ids[0].cpu().numpy(), skip_special_tokens=True)
         lowercase_text = decoded_text.lower()
-        lowercase_ids = tokenizer(lowercase_text, return_tensors='pt').input_ids.to(device)
+        lowercase_ids = tokenizer(lowercase_text, return_tensors='pt').input_ids.to(primary_device)
         
         if lowercase_ids.shape[1] > 1:
             lowercase_outputs = model(lowercase_ids, labels=lowercase_ids)
