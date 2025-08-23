@@ -1,5 +1,6 @@
 """
 LLM Data Extraction with Multiple Scoring Methods.
+Enhanced for multi-GPU support on Kaggle.
 
 This script generates text continuations using various scoring methods
 for membership inference attacks and data extraction evaluation.
@@ -14,6 +15,7 @@ import pandas as pd
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+import gc
 
 from utils import (
     init_seeds, load_model_and_tokenizer, load_prompts, write_array,
@@ -21,7 +23,7 @@ from utils import (
     calculate_recall, calculate_con_recall, calculate_min_k_scores, calculate_zlib_scores,
     calculate_metric_scores, calculate_high_confidence_scores, calculate_lowercase_score,
     write_guesses_to_csv, calculate_metrics, get_scoring_methods, 
-    get_argmin_methods, get_argmax_methods
+    get_argmin_methods, get_argmax_methods, get_model_device
 )
 
 # Constants
@@ -35,19 +37,29 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+def print_gpu_memory():
+    """Print current GPU memory usage for all available GPUs."""
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**3
+            cached = torch.cuda.memory_reserved(i) / 1024**3
+            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            print(f"GPU {i}: {allocated:.1f}/{total:.1f}GB allocated, {cached:.1f}GB cached")
+
+
 @torch.no_grad()
 def generate_and_score(prompts: np.ndarray, 
                       model, 
                       tokenizer,
                       batch_size: int = 64,
-                      micro_batch_size: int = 32, # New parameter for memory management
+                      micro_batch_size: int = 16,  # Reduced default for better memory management
                       skip_generation: bool = False,
                       non_member_prefix: np.ndarray = None,
                       member_prefix: np.ndarray = None,
                       generation_params: Dict = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
     Generate text continuations and calculate all scoring metrics using micro-batching
-    to manage memory on GPUs.
+    to manage memory on GPUs with enhanced multi-GPU support.
     """
     if generation_params is None:
         generation_params = {
@@ -56,10 +68,22 @@ def generate_and_score(prompts: np.ndarray,
             'repetition_penalty': 1.0, 'pad_token_id': tokenizer.pad_token_id, 'use_cache': True
         }
     
-    device = next(model.parameters()).device
+    device = get_model_device(model)
     scoring_methods = get_scoring_methods(K_RATIOS)
     all_generations = []
     all_scores = {method: [] for method in scoring_methods}
+    
+    # Print initial GPU memory state
+    print("Initial GPU memory state:")
+    print_gpu_memory()
+    
+    # Adjust micro_batch_size based on available GPUs
+    if torch.cuda.device_count() > 1:
+        # With DataParallel, we can process larger micro-batches since work is distributed
+        effective_micro_batch_size = micro_batch_size * torch.cuda.device_count()
+        print(f"Multi-GPU detected: effective micro_batch_size = {effective_micro_batch_size}")
+    else:
+        effective_micro_batch_size = micro_batch_size
     
     # Outer loop for the user-defined large batches
     for off in tqdm(range(0, len(prompts), batch_size), desc="Processing Large Batches"):
@@ -70,106 +94,134 @@ def generate_and_score(prompts: np.ndarray,
         batch_scores = {method: [] for method in scoring_methods}
         
         # Inner loop for memory-safe micro-batches
-        for i in range(0, len(prompt_batch), micro_batch_size):
-            micro_batch_prompts = prompt_batch[i:i + micro_batch_size]
+        for i in range(0, len(prompt_batch), effective_micro_batch_size):
+            micro_batch_prompts = prompt_batch[i:i + effective_micro_batch_size]
             micro_batch_prompts = np.stack(micro_batch_prompts, axis=0)
             input_ids = torch.tensor(micro_batch_prompts, dtype=torch.int64, device=device)
             
-            if not skip_generation:
-                ### START OF FIX ###
-                # Check if the model is wrapped in DataParallel and access the actual model via .module
-                generate_func = model.generate
-                if isinstance(model, torch.nn.DataParallel):
-                    generate_func = model.module.generate
-                ### END OF FIX ###
+            # Clear cache before each micro-batch to prevent OOM
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            try:
+                if not skip_generation:
+                    # Handle generation for both DataParallel and regular models
+                    if isinstance(model, torch.nn.DataParallel):
+                        # DataParallel wraps the model, so we access the generate method through module
+                        generated_tokens = model.module.generate(
+                            input_ids,
+                            attention_mask=torch.ones_like(input_ids),
+                            **generation_params
+                        )
+                    else:
+                        generated_tokens = model.generate(
+                            input_ids,
+                            attention_mask=torch.ones_like(input_ids),
+                            **generation_params
+                        )
+                else:
+                    generated_tokens = input_ids
+                
+                # The forward pass works fine with DataParallel directly
+                outputs = model(generated_tokens, labels=generated_tokens)
+                
+                # Process outputs
+                full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+                full_loss_per_token_flat = F.cross_entropy(full_logits, generated_tokens[:, 1:].flatten(), reduction='none')
 
-                generated_tokens = generate_func(
-                    input_ids,
-                    attention_mask=torch.ones_like(input_ids),
-                    **generation_params
+                high_conf_scores = calculate_high_confidence_scores(
+                    outputs.logits[:, :-1], full_loss_per_token_flat, SUFFIX_LEN
                 )
-            else:
-                generated_tokens = input_ids
-            
-            # The forward pass call `model(...)` works fine with DataParallel directly
-            outputs = model(generated_tokens, labels=generated_tokens)
-            
-            full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-            full_loss_per_token_flat = F.cross_entropy(full_logits, generated_tokens[:, 1:].flatten(), reduction='none')
+                batch_scores["high_confidence"].extend(high_conf_scores)
 
-            high_conf_scores = calculate_high_confidence_scores(
-                outputs.logits[:, :-1], full_loss_per_token_flat, SUFFIX_LEN
-            )
-            batch_scores["high_confidence"].extend(high_conf_scores)
+                loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -SUFFIX_LEN:]
+                likelihood = loss_per_token.mean(1)
+                batch_scores["likelihood"].extend(likelihood.cpu().numpy())
+                
+                batch_scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
+                batch_scores["metric"].extend(calculate_metric_scores(loss_per_token))
+                
+                full_labels = generated_tokens[:, 1:].contiguous()
+                mask = (full_labels != tokenizer.pad_token_id).float()
+                original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
+                
+                batch_scores["lowercase"].extend(calculate_lowercase_score(
+                    generated_tokens, original_nlls, model, tokenizer, device
+                ))
+                
+                # Use ThreadPoolExecutor for parallel computation of complex scores
+                with ThreadPoolExecutor(max_workers=min(4, len(generated_tokens))) as executor:
+                    futures = { 'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': [] }
+                    for batch_idx in range(generated_tokens.shape[0]):
+                        input_toks = input_ids[batch_idx]
+                        suffix_toks = generated_tokens[batch_idx, -SUFFIX_LEN:]
+                        futures['suffix_recall'].append(executor.submit(calculate_recall_scores, input_toks, suffix_toks, model, device))
+                        futures['suffix_conrecall'].append(executor.submit(calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device, non_member_prefix, off + i + batch_idx))
+                        if non_member_prefix is not None:
+                            nm_prefix = torch.tensor(non_member_prefix[batch_idx % len(non_member_prefix)], dtype=torch.int64)
+                            futures['recall'].append(executor.submit(calculate_recall, nm_prefix, input_toks, suffix_toks, model, device))
+                            if member_prefix is not None:
+                                m_prefix = torch.tensor(member_prefix[batch_idx % len(member_prefix)], dtype=torch.int64)
+                                futures['con_recall'].append(executor.submit(calculate_con_recall, nm_prefix, m_prefix, generated_tokens[batch_idx], original_nlls[batch_idx].item(), model, device))
+                    
+                    # Collect results
+                    for ll_u, ll_c in [f.result() for f in futures['suffix_recall']]:
+                        nll_unconditional = -ll_u
+                        nll_conditional = -ll_c
+                        batch_scores["suffix_recall"].append(nll_unconditional / nll_conditional if nll_conditional != 0 else 0)
+                    for score in [f.result() for f in futures['suffix_conrecall']]:
+                        batch_scores["suffix_conrecall"].append(score)
+                    for nll_u, nll_c in [f.result() for f in futures['recall']]:
+                        batch_scores["recall"].append(nll_c / nll_u if nll_u != 0 else 0)
+                    for score in [f.result() for f in futures['con_recall']]:
+                        batch_scores["con_recall"].append(score)
 
-            loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -SUFFIX_LEN:]
-            likelihood = loss_per_token.mean(1)
-            batch_scores["likelihood"].extend(likelihood.cpu().numpy())
-            
-            batch_scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
-            batch_scores["metric"].extend(calculate_metric_scores(loss_per_token))
-            
-            full_labels = generated_tokens[:, 1:].contiguous()
-            mask = (full_labels != tokenizer.pad_token_id).float()
-            original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
-            
-            batch_scores["lowercase"].extend(calculate_lowercase_score(
-                generated_tokens, original_nlls, model, tokenizer, device
-            ))
-            
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = { 'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': [] }
-                for batch_idx in range(generated_tokens.shape[0]):
-                    input_toks = input_ids[batch_idx]
-                    suffix_toks = generated_tokens[batch_idx, -SUFFIX_LEN:]
-                    futures['suffix_recall'].append(executor.submit(calculate_recall_scores, input_toks, suffix_toks, model, device))
-                    futures['suffix_conrecall'].append(executor.submit(calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device, non_member_prefix, off + i + batch_idx))
-                    if non_member_prefix is not None:
-                        nm_prefix = torch.tensor(non_member_prefix[batch_idx % len(non_member_prefix)], dtype=torch.int64)
-                        futures['recall'].append(executor.submit(calculate_recall, nm_prefix, input_toks, suffix_toks, model, device))
-                        if member_prefix is not None:
-                            m_prefix = torch.tensor(member_prefix[batch_idx % len(member_prefix)], dtype=torch.int64)
-                            futures['con_recall'].append(executor.submit(calculate_con_recall, nm_prefix, m_prefix, generated_tokens[batch_idx], original_nlls[batch_idx].item(), model, device))
-                for ll_u, ll_c in [f.result() for f in futures['suffix_recall']]:
-                    # Corrected division for suffix_recall (NLL / NLL)
-                    nll_unconditional = -ll_u
-                    nll_conditional = -ll_c
-                    batch_scores["suffix_recall"].append(nll_unconditional / nll_conditional if nll_conditional != 0 else 0)
-                for score in [f.result() for f in futures['suffix_conrecall']]:
-                    batch_scores["suffix_conrecall"].append(score)
-                for nll_u, nll_c in [f.result() for f in futures['recall']]:
-                    batch_scores["recall"].append(nll_c / nll_u if nll_u != 0 else 0)
-                for score in [f.result() for f in futures['con_recall']]:
-                    batch_scores["con_recall"].append(score)
+                # Calculate min-k scores efficiently
+                logits_batch = outputs.logits[:, :-1]
+                log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+                entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
+                
+                input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
+                token_log_probs, mink_plus = calculate_min_k_scores(logits_batch, input_ids_batch, device)
+                
+                for batch_idx in range(token_log_probs.shape[0]):
+                    seq_token_log_probs = token_log_probs[batch_idx][-SUFFIX_LEN:]
+                    seq_mink_plus = mink_plus[batch_idx][-SUFFIX_LEN:]
+                    seq_entropy = entropy_batch[batch_idx][-SUFFIX_LEN:]
+                    for ratio in K_RATIOS:
+                        k_length = int(SUFFIX_LEN * ratio)
+                        if k_length == 0: continue
+                        batch_scores[f'min_k_{ratio}'].append(np.mean(np.sort(seq_token_log_probs)[:k_length]))
+                        batch_scores[f'min_k_plus_{ratio}'].append(np.mean(np.sort(seq_mink_plus)[:k_length]))
+                        mink_idx = np.argsort(seq_token_log_probs)[:k_length]
+                        entropy_idx = np.where(seq_entropy.cpu().numpy() < MAX_ENTROPY)[0]
+                        intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
+                        surprise_score = np.mean(seq_token_log_probs[intersection]) if len(intersection) > 0 else -100.0
+                        batch_scores[f'surprise_{ratio}'].append(surprise_score)
 
-            logits_batch = outputs.logits[:, :-1]
-            log_probs_batch = F.log_softmax(logits_batch, dim=-1)
-            entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
-            
-            input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
-            token_log_probs, mink_plus = calculate_min_k_scores(logits_batch, input_ids_batch, device)
-            
-            for batch_idx in range(token_log_probs.shape[0]):
-                seq_token_log_probs = token_log_probs[batch_idx][-SUFFIX_LEN:]
-                seq_mink_plus = mink_plus[batch_idx][-SUFFIX_LEN:]
-                seq_entropy = entropy_batch[batch_idx][-SUFFIX_LEN:]
-                for ratio in K_RATIOS:
-                    k_length = int(SUFFIX_LEN * ratio)
-                    if k_length == 0: continue
-                    batch_scores[f'min_k_{ratio}'].append(np.mean(np.sort(seq_token_log_probs)[:k_length]))
-                    batch_scores[f'min_k_plus_{ratio}'].append(np.mean(np.sort(seq_mink_plus)[:k_length]))
-                    mink_idx = np.argsort(seq_token_log_probs)[:k_length]
-                    entropy_idx = np.where(seq_entropy.cpu().numpy() < MAX_ENTROPY)[0]
-                    intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
-                    surprise_score = np.mean(seq_token_log_probs[intersection]) if len(intersection) > 0 else -100.0
-                    batch_scores[f'surprise_{ratio}'].append(surprise_score)
-
-            batch_generations.extend(generated_tokens.cpu().numpy())
+                batch_generations.extend(generated_tokens.cpu().numpy())
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"OOM error at micro-batch {i}, reducing effective batch size and retrying...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # Reduce micro batch size and retry
+                    effective_micro_batch_size = max(1, effective_micro_batch_size // 2)
+                    continue
+                else:
+                    raise e
 
         all_generations.extend(batch_generations)
         for method in scoring_methods:
             all_scores[method].extend(batch_scores[method])
+        
+        # Print memory usage periodically
+        if (off // batch_size + 1) % 5 == 0:
+            print(f"After batch {off // batch_size + 1}:")
+            print_gpu_memory()
     
+    # Handle cases where k_length was 0 for some ratios
     for ratio in K_RATIOS:
         if int(SUFFIX_LEN * ratio) == 0:
             num_missing = len(prompts) - len(all_scores[f'min_k_{ratio}'])
@@ -186,17 +238,23 @@ def generate_and_score(prompts: np.ndarray,
 
 
 def run_extraction(args):
-    """Main extraction pipeline."""
+    """Main extraction pipeline with enhanced multi-GPU support."""
     print(f"Starting extraction with {args.model}")
+    print(f"Batch size: {args.batch_size}, Micro batch size: {args.micro_batch_size}")
     
     init_seeds(args.seed)
     model, tokenizer = load_model_and_tokenizer(args.model)
+    
+    # Print model info
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {num_params:,}")
     
     experiment_base, generations_base, losses_base = prepare_directories(
         args.root_dir, args.experiment_name
     )
     
     prompts = load_prompts(args.dataset_dir, "train_prefix.npy")[-args.val_set_num:]
+    print(f"Loaded {len(prompts)} prompts")
     
     non_member_prefix, member_prefix = None, None
     try:
@@ -212,7 +270,7 @@ def run_extraction(args):
 
     generation_params = {
         'max_length': SUFFIX_LEN + PREFIX_LEN, 'do_sample': True, 'top_k': args.top_k,
-        'top_p': args.top_p, 'temperature': args.temperature, 'typical_p':args.typical_p,
+        'top_p': args.top_p, 'temperature': args.temperature, 'typical_p': args.typical_p,
         'repetition_penalty': args.repetition_penalty, 'pad_token_id': tokenizer.pad_token_id, 'use_cache': True
     }
     
@@ -228,7 +286,7 @@ def run_extraction(args):
             model=model,
             tokenizer=tokenizer,
             batch_size=args.batch_size,
-            micro_batch_size=args.micro_batch_size, # Pass the new arg
+            micro_batch_size=args.micro_batch_size,
             non_member_prefix=non_member_prefix,
             member_prefix=member_prefix,
             generation_params=generation_params
@@ -245,6 +303,12 @@ def run_extraction(args):
                 all_scores[method].append(scores[method])
         
         all_generations.append(generations)
+        
+        # Clean up after each trial
+        del generations, scores
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
     
     all_generations = np.stack(all_generations, axis=1)
     for method in scoring_methods:
@@ -300,22 +364,25 @@ def run_extraction(args):
     else:
         print("No metrics were generated.")
 
+    print("\nFinal GPU memory state:")
+    print_gpu_memory()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM Data Extraction with Multiple Scoring Methods")
+    parser = argparse.ArgumentParser(description="LLM Data Extraction with Multiple Scoring Methods - Multi-GPU Enhanced")
     
-    parser.add_argument('--dataset_dir', type=str, default="../datasets", help='Path to dataset directory')
+    parser.add_argument('--dataset_dir', type=str, default="./datasets", help='Path to dataset directory')
     parser.add_argument('--root_dir', type=str, default="tmp/", help='Root directory for results')
     parser.add_argument('--experiment_name', type=str, default='extraction_experiment', help='Name of the experiment')
     parser.add_argument('--model', type=str, default='EleutherAI/gpt-neo-1.3B', help='Model name or path')
     parser.add_argument('--num_trials', type=int, default=5, help='Number of generation trials per prompt')
     parser.add_argument('--val_set_num', type=int, default=1000, help='Number of validation examples to use')
     parser.add_argument('--batch_size', type=int, default=128, help='Total batch size to process')
-    parser.add_argument('--micro_batch_size', type=int, default=32, help='Batch size for each GPU to prevent OOM')
+    parser.add_argument('--micro_batch_size', type=int, default=16, help='Micro batch size per GPU to prevent OOM')
     parser.add_argument('--top_k', type=int, default=50, help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0, help='Top-p for generation')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for generation')
-    parser.add_argument('--typical_p', type=float, default=1.0, help='Typical p for generation for generation')
+    parser.add_argument('--typical_p', type=float, default=1.0, help='Typical p for generation')
     parser.add_argument('--repetition_penalty', type=float, default=1.0, help='Repetition penalty for generation')
     parser.add_argument('--save_all_generations_per_prompt', action='store_true', help='Save guess CSVs for all generation count tiers')
     parser.add_argument('--save_all_methods', action='store_true', help='Save guess CSVs for all scoring methods')

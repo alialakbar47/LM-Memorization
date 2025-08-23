@@ -1,5 +1,6 @@
 """
 Utility functions for LLM data extraction and MIA evaluation.
+Enhanced for multi-GPU support.
 """
 
 import os
@@ -30,23 +31,45 @@ def init_seeds(seed: int):
 
 @functools.lru_cache(maxsize=1)
 def load_model_and_tokenizer(model_name: str = "EleutherAI/gpt-neo-1.3B"):
-    """Load model and tokenizer with caching and multi-GPU data parallel support."""
-    # Use CUDA if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """Load model and tokenizer with enhanced multi-GPU support."""
+    # Check GPU availability and print detailed info
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"CUDA available with {num_gpus} GPU(s):")
+        for i in range(num_gpus):
+            gpu_props = torch.cuda.get_device_properties(i)
+            memory_gb = gpu_props.total_memory / 1024**3
+            print(f"  GPU {i}: {gpu_props.name} ({memory_gb:.1f} GB)")
+        device = torch.device("cuda:0")
+    else:
+        print("CUDA not available, using CPU")
+        device = torch.device("cpu")
     
-    print(f"Loading model '{model_name}' to '{device}'...")
+    print(f"Loading model '{model_name}'...")
+    
+    # Load model with optimized settings for multi-GPU
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
-        # device_map="auto" is removed to enable manual DataParallel
+        low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+        device_map=None,  # We'll handle device placement manually
     )
-    # Move model to the primary device
+    
+    # Move model to primary device first
     model.to(device)
+    print(f"Model loaded to {device}")
 
     # Enable multi-GPU processing using DataParallel if available
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs via torch.nn.DataParallel.")
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"Enabling DataParallel across {torch.cuda.device_count()} GPUs")
         model = torch.nn.DataParallel(model)
+        print("DataParallel enabled successfully")
+        
+        # Print memory usage across all GPUs
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**3
+            cached = torch.cuda.memory_reserved(i) / 1024**3
+            print(f"  GPU {i}: {allocated:.1f}GB allocated, {cached:.1f}GB cached")
 
     model.eval()
     
@@ -93,6 +116,22 @@ def prepare_directories(root_dir: str, experiment_name: str):
     return experiment_base, generations_base, losses_base
 
 
+def get_model_device(model):
+    """Get the device of the model, handling DataParallel case."""
+    if isinstance(model, torch.nn.DataParallel):
+        return next(model.module.parameters()).device
+    else:
+        return next(model.parameters()).device
+
+
+def get_model_vocab_size(model):
+    """Get vocabulary size, handling DataParallel case."""
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module.config.vocab_size
+    else:
+        return model.config.vocab_size
+
+
 def perturb_prefix(prefix_tokens: torch.Tensor, vocab_size: int, p: float = 0.2) -> torch.Tensor:
     """Randomly replaces a fraction `p` of tokens in a prefix."""
     perturbed_tokens = prefix_tokens.clone()
@@ -120,10 +159,22 @@ def get_ll(model, tokens: torch.Tensor, device: torch.device) -> float:
 def get_cond_ll(model, prefix: torch.Tensor, suffix: torch.Tensor, device: torch.device) -> float:
     """Helper to get the mean conditional log-likelihood of a suffix given a prefix."""
     prefix_outputs = model(prefix.unsqueeze(0).to(device))
-    # DataParallel may not have past_key_values at the top level
+    # Handle both DataParallel and regular models
     past_key_values = getattr(prefix_outputs, 'past_key_values', None)
-    cache = DynamicCache.from_legacy_cache(past_key_values)
-    suffix_outputs = model(suffix.unsqueeze(0).to(device), past_key_values=cache)
+    if past_key_values is not None:
+        cache = DynamicCache.from_legacy_cache(past_key_values)
+        suffix_outputs = model(suffix.unsqueeze(0).to(device), past_key_values=cache)
+    else:
+        # Fallback: compute full sequence if caching fails
+        full_sequence = torch.cat([prefix, suffix])
+        full_outputs = model(full_sequence.unsqueeze(0).to(device))
+        # Extract logits for suffix positions
+        prefix_len = len(prefix)
+        suffix_logits = full_outputs.logits[0, prefix_len-1:-1]
+        log_probs = F.log_softmax(suffix_logits, dim=-1)
+        token_log_probs = log_probs.gather(dim=-1, index=suffix[1:].unsqueeze(-1)).squeeze()
+        return token_log_probs.mean().item()
+    
     logits = suffix_outputs.logits[:, :-1]
     log_probs = F.log_softmax(logits, dim=-1)
     token_log_probs = log_probs.gather(dim=-1, index=suffix[1:].unsqueeze(0).unsqueeze(-1)).squeeze()
@@ -137,6 +188,7 @@ def calculate_recall_scores(prefix_tokens: torch.Tensor, suffix_tokens: torch.Te
     ll_unconditional = get_ll(model, suffix_tokens, device)
     ll_conditional = get_cond_ll(model, prefix_tokens, suffix_tokens, device)
     return ll_unconditional, ll_conditional
+
 
 @torch.no_grad()
 def calculate_suffix_con_recall(prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor,
@@ -169,7 +221,8 @@ def calculate_suffix_con_recall(prefix_tokens: torch.Tensor, suffix_tokens: torc
             non_member_prefix = repeated[:target_length]
     else:
         # Fallback to simple perturbation if no pool provided
-        non_member_prefix = (prefix_tokens + 1000) % tokenizer.vocab_size
+        vocab_size = get_model_vocab_size(model)
+        non_member_prefix = (prefix_tokens + 1000) % vocab_size
     
     # 1. NLL of suffix conditioned on original prefix (member context)
     member_sequence = torch.cat([prefix_tokens, suffix_tokens])
