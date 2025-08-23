@@ -76,9 +76,12 @@ def generate_and_score(prompts: np.ndarray,
             input_ids = torch.tensor(micro_batch_prompts, dtype=torch.int64, device=device)
             
             if not skip_generation:
+                ### START OF FIX ###
+                # Check if the model is wrapped in DataParallel and access the actual model via .module
                 generate_func = model.generate
                 if isinstance(model, torch.nn.DataParallel):
                     generate_func = model.module.generate
+                ### END OF FIX ###
 
                 generated_tokens = generate_func(
                     input_ids,
@@ -88,6 +91,7 @@ def generate_and_score(prompts: np.ndarray,
             else:
                 generated_tokens = input_ids
             
+            # The forward pass call `model(...)` works fine with DataParallel directly
             outputs = model(generated_tokens, labels=generated_tokens)
             
             full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
@@ -109,12 +113,9 @@ def generate_and_score(prompts: np.ndarray,
             mask = (full_labels != tokenizer.pad_token_id).float()
             original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
             
-            # This is the memory-intensive part, now operating on a smaller micro-batch
             batch_scores["lowercase"].extend(calculate_lowercase_score(
                 generated_tokens, original_nlls, model, tokenizer, device
             ))
-
-            # No need for manual memory clearing now, as scopes are smaller
             
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = { 'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': [] }
@@ -130,7 +131,10 @@ def generate_and_score(prompts: np.ndarray,
                             m_prefix = torch.tensor(member_prefix[batch_idx % len(member_prefix)], dtype=torch.int64)
                             futures['con_recall'].append(executor.submit(calculate_con_recall, nm_prefix, m_prefix, generated_tokens[batch_idx], original_nlls[batch_idx].item(), model, device))
                 for ll_u, ll_c in [f.result() for f in futures['suffix_recall']]:
-                    batch_scores["suffix_recall"].append(-ll_u / -ll_c if ll_c != 0 else 0)
+                    # Corrected division for suffix_recall (NLL / NLL)
+                    nll_unconditional = -ll_u
+                    nll_conditional = -ll_c
+                    batch_scores["suffix_recall"].append(nll_unconditional / nll_conditional if nll_conditional != 0 else 0)
                 for score in [f.result() for f in futures['suffix_conrecall']]:
                     batch_scores["suffix_conrecall"].append(score)
                 for nll_u, nll_c in [f.result() for f in futures['recall']]:
@@ -162,12 +166,10 @@ def generate_and_score(prompts: np.ndarray,
 
             batch_generations.extend(generated_tokens.cpu().numpy())
 
-        # Consolidate results from micro-batches into the main lists
         all_generations.extend(batch_generations)
         for method in scoring_methods:
             all_scores[method].extend(batch_scores[method])
     
-    # Final processing, same as before
     for ratio in K_RATIOS:
         if int(SUFFIX_LEN * ratio) == 0:
             num_missing = len(prompts) - len(all_scores[f'min_k_{ratio}'])
@@ -302,7 +304,6 @@ def run_extraction(args):
 def main():
     parser = argparse.ArgumentParser(description="LLM Data Extraction with Multiple Scoring Methods")
     
-    # ... (rest of the arguments are the same)
     parser.add_argument('--dataset_dir', type=str, default="../datasets", help='Path to dataset directory')
     parser.add_argument('--root_dir', type=str, default="tmp/", help='Root directory for results')
     parser.add_argument('--experiment_name', type=str, default='extraction_experiment', help='Name of the experiment')
@@ -310,7 +311,6 @@ def main():
     parser.add_argument('--num_trials', type=int, default=5, help='Number of generation trials per prompt')
     parser.add_argument('--val_set_num', type=int, default=1000, help='Number of validation examples to use')
     parser.add_argument('--batch_size', type=int, default=128, help='Total batch size to process')
-    # NEW ARGUMENT
     parser.add_argument('--micro_batch_size', type=int, default=32, help='Batch size for each GPU to prevent OOM')
     parser.add_argument('--top_k', type=int, default=50, help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0, help='Top-p for generation')
