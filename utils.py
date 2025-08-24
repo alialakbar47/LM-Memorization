@@ -1,5 +1,5 @@
 """
-Utility functions for LLM data extraction and MIA evaluation with multi-GPU support.
+Utility functions for LLM data extraction and MIA evaluation with multi-GPU support and memory optimization.
 """
 
 import os
@@ -94,6 +94,22 @@ def safe_generate(model, *args, **kwargs):
     else:
         # Model is not wrapped
         return model.generate(*args, **kwargs)
+
+
+def optimize_batch_size_for_multi_gpu(base_batch_size: int, num_gpus: int) -> int:
+    """
+    Optimize batch size for multi-GPU setup.
+    Ensures batch size is divisible by number of GPUs and maximizes utilization.
+    """
+    if num_gpus == 1:
+        return base_batch_size
+    
+    # Make batch size divisible by number of GPUs
+    optimized_size = (base_batch_size // num_gpus) * num_gpus
+    if optimized_size == 0:
+        optimized_size = num_gpus
+    
+    return optimized_size
 
 
 def load_prompts(dir_path: str, file_name: str, allow_pickle: bool = False) -> np.ndarray:
@@ -351,35 +367,60 @@ def calculate_lowercase_score(
     tokenizer,
     device: torch.device
 ) -> np.ndarray:
-    """Calculate lowercase scores for a batch of generated sequences."""
-    base_model = get_base_model(model)
+    """Calculate lowercase scores with aggressive memory optimization."""
+    batch_size = generated_tokens.shape[0]
     
-    decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-    lowercase_texts = [text.lower() for text in decoded_texts]
+    # Process one item at a time to avoid OOM
+    all_scores = []
     
-    lowercase_inputs = tokenizer(
-        lowercase_texts,
-        return_tensors='pt',
-        padding=True,
-        truncation=True,
-        max_length=generated_tokens.shape[1]
-    ).to(device)
+    for i in range(batch_size):
+        try:
+            # Clear cache before each item
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            single_token = generated_tokens[i:i+1]  # Keep batch dimension
+            single_nll = original_nlls[i]
+            
+            # Decode and lowercase
+            decoded_text = tokenizer.decode(single_token[0], skip_special_tokens=True)
+            lowercase_text = decoded_text.lower()
+            
+            # Skip if no change
+            if decoded_text == lowercase_text:
+                all_scores.append(1.0)
+                continue
+            
+            # Tokenize lowercase version with truncation
+            max_length = min(single_token.shape[1], 512)  # Limit max length
+            lowercase_inputs = tokenizer(
+                lowercase_text,
+                return_tensors='pt',
+                truncation=True,
+                max_length=max_length
+            ).to(device)
+            
+            # Use base model to avoid DataParallel overhead for single items
+            base_model = get_base_model(model)
+            lowercase_outputs = base_model(
+                lowercase_inputs.input_ids, 
+                labels=lowercase_inputs.input_ids
+            )
+            
+            lowercase_nll = lowercase_outputs.loss.item()
+            score = -single_nll.item() / (lowercase_nll + 1e-9)
+            all_scores.append(score)
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"OOM in lowercase calculation for item {i}, using fallback")
+            all_scores.append(0.0)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Error in lowercase calculation for item {i}: {e}")
+            all_scores.append(0.0)
     
-    lowercase_outputs = base_model(lowercase_inputs.input_ids, labels=lowercase_inputs.input_ids)
-    
-    lowercase_logits = lowercase_outputs.logits
-    shift_logits = lowercase_logits[..., :-1, :].contiguous()
-    shift_labels = lowercase_inputs.input_ids[..., 1:].contiguous()
-    
-    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    loss = loss.view(shift_labels.size())
-    
-    mask = (shift_labels != tokenizer.pad_token_id).float()
-    lowercase_nlls = (loss * mask).sum(dim=1)
-
-    scores = -original_nlls / (lowercase_nlls + 1e-9)
-    return scores.cpu().numpy()
+    return np.array(all_scores)
 
 
 def write_guesses_to_csv(generations_per_prompt: int, 
