@@ -123,7 +123,8 @@ def generate_and_score(prompts: np.ndarray,
                     generated_tokens = input_ids
                 
                 # The forward pass works fine with DataParallel directly
-                outputs = model(generated_tokens, labels=generated_tokens)
+                outputs = model(input_ids=generated_tokens, labels=generated_tokens)
+
                 
                 # Process outputs
                 full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
