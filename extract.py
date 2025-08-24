@@ -22,7 +22,8 @@ from utils import (
     calculate_recall, calculate_con_recall, calculate_min_k_scores, calculate_zlib_scores,
     calculate_metric_scores, calculate_high_confidence_scores, calculate_lowercase_score,
     write_guesses_to_csv, calculate_metrics, get_scoring_methods, 
-    get_argmin_methods, get_argmax_methods, get_base_model, setup_multi_gpu
+    get_argmin_methods, get_argmax_methods, get_base_model, setup_multi_gpu,
+    safe_generate  # Import the new safe_generate function
 )
 
 # Constants
@@ -96,8 +97,9 @@ def generate_and_score(prompts: np.ndarray,
         input_ids = torch.tensor(prompt_batch, dtype=torch.int64, device=device)
         
         if not skip_generation:
-            # Generate text continuations
-            generated_tokens = model.generate(
+            # Generate text continuations - FIXED: Use safe_generate
+            generated_tokens = safe_generate(
+                model,
                 input_ids,
                 attention_mask=torch.ones_like(input_ids),
                 **generation_params

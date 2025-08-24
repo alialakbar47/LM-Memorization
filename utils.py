@@ -86,6 +86,16 @@ def get_base_model(model):
     return model
 
 
+def safe_generate(model, *args, **kwargs):
+    """Safely call generate method on model, handling DataParallel wrapping."""
+    if hasattr(model, 'module'):
+        # Model is wrapped with DataParallel/DistributedDataParallel
+        return model.module.generate(*args, **kwargs)
+    else:
+        # Model is not wrapped
+        return model.generate(*args, **kwargs)
+
+
 def load_prompts(dir_path: str, file_name: str, allow_pickle: bool = False) -> np.ndarray:
     """Load prompts from numpy file."""
     try:
