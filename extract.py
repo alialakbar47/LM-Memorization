@@ -1,7 +1,5 @@
-
-
 """
-LLM Data Extraction with Multiple Scoring Methods.
+LLM Data Extraction with Multiple Scoring Methods - Enhanced with Checkpoint/Resume.
 
 This script generates text continuations using various scoring methods
 for membership inference attacks and data extraction evaluation.
@@ -13,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import pickle
+import json
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -35,6 +35,66 @@ MAX_ENTROPY = 2.0
 # Enable TF32 for faster computation on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+class CheckpointManager:
+    """Manages checkpointing and resuming for experiments."""
+    
+    def __init__(self, experiment_base: str, checkpoint_name: str = "checkpoint.pkl"):
+        self.checkpoint_path = os.path.join(experiment_base, checkpoint_name)
+        self.experiment_base = experiment_base
+        
+    def save_checkpoint(self, trial: int, all_generations: List, all_scores: Dict, 
+                       args: argparse.Namespace, rng_states: Dict):
+        """Save current progress to checkpoint file."""
+        checkpoint_data = {
+            'trial': trial,
+            'all_generations': all_generations,
+            'all_scores': all_scores,
+            'args': vars(args),
+            'rng_states': rng_states
+        }
+        
+        # Save to temporary file first, then rename (atomic operation)
+        temp_path = self.checkpoint_path + ".tmp"
+        with open(temp_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        os.rename(temp_path, self.checkpoint_path)
+        print(f"Checkpoint saved after trial {trial + 1}")
+        
+    def load_checkpoint(self):
+        """Load checkpoint if it exists."""
+        if os.path.exists(self.checkpoint_path):
+            with open(self.checkpoint_path, 'rb') as f:
+                return pickle.load(f)
+        return None
+    
+    def cleanup_checkpoint(self):
+        """Remove checkpoint file after successful completion."""
+        if os.path.exists(self.checkpoint_path):
+            os.remove(self.checkpoint_path)
+            print("Checkpoint file cleaned up")
+
+    def get_rng_states(self):
+        """Get current random number generator states."""
+        return {
+            'python_random': np.random.get_state(),
+            'numpy_random': np.random.get_state(),
+            'torch_random': torch.get_rng_state(),
+            'torch_cuda_random': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        }
+    
+    def set_rng_states(self, rng_states: Dict):
+        """Restore random number generator states."""
+        if 'python_random' in rng_states:
+            np.random.set_state(rng_states['python_random'])
+        if 'numpy_random' in rng_states:
+            np.random.set_state(rng_states['numpy_random'])
+        if 'torch_random' in rng_states:
+            torch.set_rng_state(rng_states['torch_random'])
+        if 'torch_cuda_random' in rng_states and rng_states['torch_cuda_random'] is not None:
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_states['torch_cuda_random'])
 
 
 @torch.no_grad()
@@ -66,11 +126,11 @@ def generate_and_score(prompts: np.ndarray,
         generation_params = {
             'max_length': SUFFIX_LEN + PREFIX_LEN,
             'do_sample': True,
-            'top_k': 10, # MODIFIED: Changed fallback default to match new baseline
-            'top_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'typical_p': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'temperature': 1.0, # MODIFIED: Changed fallback default to match new baseline
-            'repetition_penalty': 1.0, # MODIFIED: Changed fallback default to match new baseline
+            'top_k': 10,
+            'top_p': 1.0,
+            'typical_p': 1.0,
+            'temperature': 1.0,
+            'repetition_penalty': 1.0,
             'pad_token_id': 50256,
             'use_cache': True
         }
@@ -137,7 +197,7 @@ def generate_and_score(prompts: np.ndarray,
                 ))
                 futures['suffix_conrecall'].append(executor.submit(
                 calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
-                non_member_prefix, off + batch_idx  # Add non_member_prefix and example_id
+                non_member_prefix, off + batch_idx
                 ))
                 
                 if non_member_prefix is not None:
@@ -210,15 +270,53 @@ def generate_and_score(prompts: np.ndarray,
 
 
 def run_extraction(args):
-    """Main extraction pipeline."""
+    """Main extraction pipeline with checkpoint/resume capability."""
     print(f"Starting extraction with {args.model}")
     
-    init_seeds(args.seed)
-    model, tokenizer = load_model_and_tokenizer(args.model)
-    
+    # Initialize directories first
     experiment_base, generations_base, losses_base = prepare_directories(
         args.root_dir, args.experiment_name
     )
+    
+    # Initialize checkpoint manager
+    checkpoint_manager = CheckpointManager(experiment_base)
+    
+    # Check for existing checkpoint
+    checkpoint_data = checkpoint_manager.load_checkpoint()
+    
+    if checkpoint_data and args.resume:
+        print("Found existing checkpoint, resuming...")
+        
+        # Restore RNG states for reproducibility
+        checkpoint_manager.set_rng_states(checkpoint_data['rng_states'])
+        
+        # Restore progress
+        start_trial = checkpoint_data['trial'] + 1
+        all_generations = checkpoint_data['all_generations']
+        all_scores = checkpoint_data['all_scores']
+        
+        print(f"Resuming from trial {start_trial + 1}/{args.num_trials}")
+        
+        # Verify args compatibility (important for reproducibility)
+        saved_args = checkpoint_data['args']
+        critical_args = ['model', 'seed', 'num_trials', 'val_set_num', 'batch_size', 
+                        'top_k', 'top_p', 'temperature', 'typical', 'repetition_penalty']
+        for arg in critical_args:
+            if getattr(args, arg) != saved_args.get(arg):
+                print(f"Warning: Argument {arg} has changed from {saved_args.get(arg)} to {getattr(args, arg)}")
+                print("This may affect reproducibility. Consider using the same parameters as the checkpoint.")
+    else:
+        if checkpoint_data and not args.resume:
+            print("Found existing checkpoint but --resume not specified. Starting fresh.")
+        
+        # Initialize seeds for fresh start
+        init_seeds(args.seed)
+        start_trial = 0
+        all_generations = []
+        all_scores = {method: [] for method in get_scoring_methods(K_RATIOS)}
+    
+    # Load model and data (this should be after RNG state restoration for consistency)
+    model, tokenizer = load_model_and_tokenizer(args.model)
     
     prompts = load_prompts(args.dataset_dir, "train_prefix.npy")[-args.val_set_num:]
     
@@ -240,17 +338,16 @@ def run_extraction(args):
         'top_k': args.top_k,
         'top_p': args.top_p,
         'temperature': args.temperature,
-        'typical_p':args.typical_p,
+        'typical_p': args.typical,
         'repetition_penalty': args.repetition_penalty,
         'pad_token_id': tokenizer.pad_token_id,
         'use_cache': True
     }
     
     scoring_methods = get_scoring_methods(K_RATIOS)
-    all_generations = []
-    all_scores = {method: [] for method in scoring_methods}
     
-    for trial in range(args.num_trials):
+    # Continue from where we left off
+    for trial in range(start_trial, args.num_trials):
         print(f'Trial {trial + 1}/{args.num_trials}...')
         
         generations, scores = generate_and_score(
@@ -269,12 +366,22 @@ def run_extraction(args):
                 if len(scores.get(method, [])) > 0:
                     write_array(os.path.join(losses_base, f"{method}_{{}}.npy"), scores[method], trial)
         
+        # Accumulate results
+        all_generations.append(generations)
         for method in scoring_methods:
             if len(scores.get(method, [])) > 0:
                 all_scores[method].append(scores[method])
         
-        all_generations.append(generations)
+        # Save checkpoint after each trial
+        if args.save_checkpoints:
+            rng_states = checkpoint_manager.get_rng_states()
+            checkpoint_manager.save_checkpoint(trial, all_generations, all_scores, args, rng_states)
     
+    # Clean up checkpoint after successful completion
+    if args.save_checkpoints:
+        checkpoint_manager.cleanup_checkpoint()
+    
+    # Convert to final format
     all_generations = np.stack(all_generations, axis=1)
     for method in scoring_methods:
         if all_scores.get(method):
@@ -366,14 +473,13 @@ def main():
                        help='Batch size for processing')
     
     # Generation parameters
-    # MODIFIED: Changed all defaults to new baseline
     parser.add_argument('--top_k', type=int, default=50,
                        help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0,
                        help='Top-p for generation')
     parser.add_argument('--temperature', type=float, default=1.0,
                        help='Temperature for generation')
-    parser.add_argument('--typical_p', type=float, default=1.0,
+    parser.add_argument('--typical', type=float, default=1.0,
                        help='Typical p for generation for generation')
     parser.add_argument('--repetition_penalty', type=float, default=1.0,
                        help='Repetition penalty for generation')
@@ -385,6 +491,12 @@ def main():
                        help='Save guess CSVs for all scoring methods, not just likelihood')
     parser.add_argument('--save_npy_files', action='store_true',
                        help='Save intermediate generation and loss .npy files')
+
+    # Checkpoint arguments
+    parser.add_argument('--save_checkpoints', action='store_true', default=True,
+                       help='Save checkpoints after each trial for resumability')
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume from existing checkpoint if available')
 
     # Other arguments
     parser.add_argument('--seed', type=int, default=2022,
