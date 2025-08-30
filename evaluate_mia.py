@@ -16,7 +16,10 @@ import torch
 import torch.nn.functional as F
 import zlib
 
-from utils import load_model_and_tokenizer, get_scoring_methods, calculate_suffix_con_recall
+from utils import (
+    load_model_and_tokenizer, get_scoring_methods, calculate_suffix_con_recall,
+    load_prompts, calculate_recall, calculate_con_recall
+)
 
 # Constants matching extract.py
 K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -32,11 +35,15 @@ def load_guess_data(guess_file: str) -> pd.DataFrame:
 
 
 @torch.no_grad()
-def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: torch.device) -> dict:
+def calculate_scores_for_evaluation(
+    model, tokenizer, df: pd.DataFrame, device: torch.device,
+    non_member_prefix: np.ndarray = None,
+    member_prefix: np.ndarray = None
+) -> dict:
     """Calculate scores for MIA evaluation."""
     scores = defaultdict(list)
     
-    for _, row in tqdm(df.iterrows(), total=len(df), desc='Calculating scores'):
+    for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Calculating scores')):
         guess = np.array(row['Suffix Guess'])
         ground_truth = np.array(row['Ground Truth'])
         
@@ -87,7 +94,30 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
         # Calculate other scores using the full sequence
         outputs = model(full_ids, labels=full_ids)
         loss, logits = outputs[:2]
+        original_nll = loss.item()
         
+        # Calculate recall and con_recall
+        if non_member_prefix is not None:
+            nm_prefix_idx = i % len(non_member_prefix)
+            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64).to(device)
+            
+            # Recall score
+            nll_u, nll_c = calculate_recall(
+                nm_prefix, prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, device
+            )
+            recall_score = nll_c / nll_u if nll_u != 0 else 0
+            scores['recall'].append(recall_score)
+
+            # Contrastive Recall score
+            if member_prefix is not None:
+                m_prefix_idx = i % len(member_prefix)
+                m_prefix = torch.tensor(member_prefix[m_prefix_idx], dtype=torch.int64).to(device)
+                
+                con_recall_score = calculate_con_recall(
+                    nm_prefix, m_prefix, full_ids.squeeze(0), original_nll, model, device
+                )
+                scores['con_recall'].append(con_recall_score)
+
         # 1. Likelihood - keep original scale (log likelihood)
         log_probs_full = F.log_softmax(logits[0, :-1], dim=-1)
         token_log_probs_full = log_probs_full.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
@@ -164,7 +194,7 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
                 scores[f'surprise_{ratio}'].append(0.0)
         
         # 6. Lowercase score
-        original_nll = F.cross_entropy(logits[0, :-1], full_ids[0, 1:], reduction='sum').item()
+        original_nll_sum = F.cross_entropy(logits[0, :-1], full_ids[0, 1:], reduction='sum').item()
         
         decoded_text = tokenizer.decode(full_ids[0].cpu().numpy(), skip_special_tokens=True)
         lowercase_text = decoded_text.lower()
@@ -174,7 +204,7 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, device: 
             lowercase_outputs = model(lowercase_ids, labels=lowercase_ids)
             lowercase_logits = lowercase_outputs.logits
             lowercase_nll = F.cross_entropy(lowercase_logits[0, :-1], lowercase_ids[0, 1:], reduction='sum').item()
-            lowercase_score = -original_nll / (lowercase_nll + 1e-9)
+            lowercase_score = -original_nll_sum / (lowercase_nll + 1e-9)
         else:
             lowercase_score = 0
         scores['lowercase'].append(lowercase_score)
@@ -248,6 +278,20 @@ def run_mia_evaluation(args):
     # Load model
     model, tokenizer = load_model_and_tokenizer(args.model)
     device = next(model.parameters()).device
+
+    # Load prefix data for recall and con_recall
+    non_member_prefix, member_prefix = None, None
+    if args.dataset_dir:
+        try:
+            non_member_prefix = load_prompts(args.dataset_dir, "non_member_prefix.npy", allow_pickle=True)
+            print(f"Loaded non-member prefix from {args.dataset_dir} for recall calculation.")
+        except FileNotFoundError:
+            print(f"Warning: non_member_prefix.npy not found in {args.dataset_dir}. `recall` and `con_recall` will not be calculated.")
+        try:
+            member_prefix = load_prompts(args.dataset_dir, "member_prefix.npy", allow_pickle=True)
+            print(f"Loaded member prefix from {args.dataset_dir} for con_recall calculation.")
+        except FileNotFoundError:
+            print(f"Warning: member_prefix.npy not found in {args.dataset_dir}. `con_recall` will not be calculated.")
     
     # Get all scoring methods
     scoring_methods = get_scoring_methods(K_RATIOS)
@@ -266,7 +310,11 @@ def run_mia_evaluation(args):
         df = load_guess_data(os.path.join(args.guess_dir, guess_file))
         
         # Calculate scores using all methods
-        scores = calculate_scores_for_evaluation(model, tokenizer, df, device)
+        scores = calculate_scores_for_evaluation(
+            model, tokenizer, df, device,
+            non_member_prefix=non_member_prefix,
+            member_prefix=member_prefix
+        )
         
         # Calculate metrics using ground truth labels
         labels = df['Is Correct'].values
@@ -341,6 +389,8 @@ def main():
     # Data arguments
     parser.add_argument('--guess_dir', type=str, required=True,
                        help='Directory containing guess CSV files')
+    parser.add_argument('--dataset_dir', type=str, default="../datasets",
+                       help='Path to dataset directory for loading prefixes needed for some scores')
     
     # Processing arguments
     parser.add_argument('--batch_size', type=int, default=32,

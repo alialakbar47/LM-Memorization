@@ -187,7 +187,8 @@ def main():
             sys.executable, "evaluate_mia.py",
             "--model", args.model,
             "--guess_dir", guess_dir,
-            "--batch_size", str(args.batch_size)
+            "--batch_size", str(args.batch_size),
+            "--dataset_dir", args.dataset_dir
         ]
         
         run_command(mia_command, "MIA Evaluation")
