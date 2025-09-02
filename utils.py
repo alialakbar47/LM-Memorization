@@ -38,25 +38,12 @@ def load_model_and_tokenizer(model_name: str = "EleutherAI/gpt-neo-1.3B"):
     )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # [FIXED] Robustly set pad_token for different model families
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            print("Warning: tokenizer has no pad_token, using eos_token as pad_token.")
-            tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         else:
-            # If there's no EOS token either, we have to add a new one.
-            # This is rare for pretrained models but good practice for robustness.
-            print("Warning: tokenizer has no pad_token or eos_token. Adding a new pad_token.")
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            # IMPORTANT: We need to resize model embeddings to account for the new token
-            model.resize_token_embeddings(len(tokenizer))
-
-    # Also ensure the model's config is aligned with the tokenizer's pad_token_id
-    # This helps with internal transformer functions like model.generate()
-    if model.config.pad_token_id is None or model.config.pad_token_id != tokenizer.pad_token_id:
-         model.config.pad_token_id = tokenizer.pad_token_id
-         
+            # Set a default pad token id if none exists
+            tokenizer.pad_token_id = 50256
     return model, tokenizer
 
 
