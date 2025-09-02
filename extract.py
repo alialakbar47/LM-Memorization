@@ -123,6 +123,7 @@ def generate_and_score(prompts: np.ndarray,
         Tuple of (generations, scores_dict)
     """
     if generation_params is None:
+        # [FIXED] Use dynamic pad_token_id from tokenizer
         generation_params = {
             'max_length': SUFFIX_LEN + PREFIX_LEN,
             'do_sample': True,
@@ -131,7 +132,7 @@ def generate_and_score(prompts: np.ndarray,
             'typical_p': 1.0,
             'temperature': 1.0,
             'repetition_penalty': 1.0,
-            'pad_token_id': 50256,
+            'pad_token_id': tokenizer.pad_token_id,
             'use_cache': True
         }
     
