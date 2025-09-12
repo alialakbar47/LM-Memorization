@@ -361,8 +361,13 @@ def run_mia_evaluation(args):
 
     df_results = pd.DataFrame(results)
 
-    # Save full results to CSV
-    save_root = "results/mia_evaluation"
+    # Save full results to CSV under results/experiment-name/mia_evaluation/
+    experiment_name = os.path.basename(args.guess_dir)  # Get experiment name from guess directory
+    if experiment_name == "guess_files":
+        # If guess_dir ends with "guess_files", get parent directory name
+        experiment_name = os.path.basename(os.path.dirname(args.guess_dir))
+    
+    save_root = os.path.join("results", experiment_name, "mia_evaluation")
     os.makedirs(save_root, exist_ok=True)
     model_id = args.model.split('/')[-1]
     output_file = os.path.join(save_root, f"{model_id}_mia_results.csv")

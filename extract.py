@@ -273,9 +273,9 @@ def run_extraction(args):
     """Main extraction pipeline with checkpoint/resume capability."""
     print(f"Starting extraction with {args.model}")
     
-    # Initialize directories first
+    # Initialize directories first - now under results/experiment-name/
     experiment_base, generations_base, losses_base = prepare_directories(
-        args.root_dir, args.experiment_name
+        "results", args.experiment_name
     )
     
     # Initialize checkpoint manager
@@ -402,6 +402,10 @@ def run_extraction(args):
     all_metrics_data = []
     full_generations_tiers = sorted(list(set([g for g in gen_tiers if g <= max_generations_per_prompt])))
     
+    # Create guess_files directory within the experiment
+    guess_files_dir = os.path.join(experiment_base, "guess_files")
+    os.makedirs(guess_files_dir, exist_ok=True)
+    
     for generations_per_prompt in full_generations_tiers:
         print(f"\nCalculating metrics for {generations_per_prompt} generations per prompt...")
         
@@ -423,7 +427,8 @@ def run_extraction(args):
         if generations_per_prompt in generations_to_process:
             methods_to_save_csv = valid_methods if args.save_all_methods else (["likelihood"] if "likelihood" in valid_methods else [])
             if methods_to_save_csv:
-                write_guesses_to_csv(generations_per_prompt, generations_dict, answers, methods_to_save_csv)
+                # Updated to save in the experiment's guess_files directory
+                write_guesses_to_csv(generations_per_prompt, generations_dict, answers, methods_to_save_csv, guess_files_dir)
         
         metrics = calculate_metrics(generations_dict, answers)
         for method, method_metrics in metrics.items():
@@ -455,8 +460,6 @@ def main():
     # Data arguments
     parser.add_argument('--dataset_dir', type=str, default="../datasets", 
                        help='Path to dataset directory')
-    parser.add_argument('--root_dir', type=str, default="tmp/", 
-                       help='Root directory for results')
     parser.add_argument('--experiment_name', type=str, default='extraction_experiment',
                        help='Name of the experiment')
     

@@ -67,7 +67,7 @@ def write_array(file_path: str, array: np.ndarray, unique_id: Union[int, str]):
 
 
 def prepare_directories(root_dir: str, experiment_name: str):
-    """Create necessary directories for experiment."""
+    """Create necessary directories for experiment under results/experiment-name/."""
     experiment_base = os.path.join(root_dir, experiment_name)
     generations_base = os.path.join(experiment_base, "generations")
     losses_base = os.path.join(experiment_base, "losses")
@@ -354,10 +354,11 @@ def calculate_lowercase_score(
 def write_guesses_to_csv(generations_per_prompt: int, 
                         generations_dict: Dict[str, np.ndarray], 
                         answers: np.ndarray, 
-                        methods: List[str]):
-    """Write guesses with ground truth labels to CSV files."""
+                        methods: List[str],
+                        output_dir: str = "."):
+    """Write guesses with ground truth labels to CSV files in specified directory."""
     for method in methods:
-        filename = f"guess_{method}_{generations_per_prompt}.csv"
+        filename = os.path.join(output_dir, f"guess_{method}_{generations_per_prompt}.csv")
         with open(filename, "w", newline='') as file_handle:
             print(f"Writing {filename}")
             writer = csv.writer(file_handle)

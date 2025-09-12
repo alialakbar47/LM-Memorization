@@ -45,8 +45,6 @@ def main():
     # Data arguments
     parser.add_argument('--dataset_dir', type=str, default="../datasets",
                        help='Path to dataset directory')
-    parser.add_argument('--root_dir', type=str, default="tmp/",
-                       help='Root directory for results')
     parser.add_argument('--experiment_name', type=str, default='pipeline_experiment',
                        help='Name of the experiment')
     
@@ -115,7 +113,7 @@ def main():
             sys.exit(1)
     
     # Handle checkpoint management
-    experiment_path = Path(args.root_dir) / args.experiment_name
+    experiment_path = Path("results") / args.experiment_name
     checkpoint_path = experiment_path / "checkpoint.pkl"
     
     if args.force_restart and checkpoint_path.exists():
@@ -131,7 +129,6 @@ def main():
         extraction_command = [
             sys.executable, "extract.py",
             "--dataset_dir", args.dataset_dir,
-            "--root_dir", args.root_dir,
             "--experiment_name", args.experiment_name,
             "--model", args.model,
             "--num_trials", str(args.num_trials),
@@ -157,31 +154,23 @@ def main():
             extraction_command.append("--resume")
         
         run_command(extraction_command, "Data Extraction")
-        
-        # Check if CSV files were generated
-        csv_files = list(Path(".").glob("guess_*.csv"))
-        if not csv_files:
-            print("Warning: No guess CSV files found after extraction. This is expected if MIA evaluation is skipped.")
-        else:
-            print(f"Generated {len(csv_files)} guess files for MIA evaluation.")
     
     # Step 2: MIA Evaluation
     if not args.skip_mia:
-        # Create a directory for guess files if it doesn't exist
-        guess_dir = "guess_files"
-        os.makedirs(guess_dir, exist_ok=True)
+        # Guess files are now saved in results/experiment-name/guess_files/
+        guess_dir = os.path.join("results", args.experiment_name, "guess_files")
         
-        # Move CSV files to guess directory for better organization
-        csv_files = list(Path(".").glob("guess_*.csv"))
-        if not csv_files:
-            print("Error: No guess CSV files found for MIA evaluation")
-            print("Either run extraction first or provide existing CSV files")
+        if not os.path.exists(guess_dir):
+            print(f"Error: Guess files directory not found at {guess_dir}")
+            print("Either run extraction first or provide existing guess files")
             sys.exit(1)
         
-        for csv_file in csv_files:
-            # Move file, overwriting if it exists from a previous run
-            target_path = Path(guess_dir) / csv_file.name
-            csv_file.replace(target_path)
+        # Check if CSV files exist
+        csv_files = list(Path(guess_dir).glob("*.csv"))
+        if not csv_files:
+            print(f"Error: No guess CSV files found in {guess_dir}")
+            print("Either run extraction first or provide existing CSV files")
+            sys.exit(1)
         
         mia_command = [
             sys.executable, "evaluate_mia.py",
@@ -200,8 +189,9 @@ def main():
     # Summary of outputs
     print("\nGenerated outputs:")
     
+    experiment_path = Path("results") / args.experiment_name
+    
     if not args.skip_extraction:
-        experiment_path = Path(args.root_dir) / args.experiment_name
         if experiment_path.exists():
             print(f"- Experiment data: {experiment_path}")
             
@@ -224,15 +214,15 @@ def main():
                 print("  (This indicates the extraction may not have completed)")
     
     if not args.skip_mia:
-        results_path = Path("results/mia_evaluation")
-        if results_path.exists():
-            result_files = list(results_path.glob("*.csv"))
+        mia_results_path = experiment_path / "mia_evaluation"
+        if mia_results_path.exists():
+            result_files = list(mia_results_path.glob("*.csv"))
             if result_files:
-                print(f"- MIA evaluation results: {results_path}")
+                print(f"- MIA evaluation results: {mia_results_path}")
                 for result_file in result_files:
                     print(f"    - {result_file.name}")
     
-    guess_path = Path("guess_files")
+    guess_path = experiment_path / "guess_files"
     if guess_path.exists():
         guess_files = list(guess_path.glob("*.csv"))
         if guess_files:
