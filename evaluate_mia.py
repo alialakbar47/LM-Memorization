@@ -3,6 +3,11 @@ Membership Inference Attack (MIA) Evaluation.
 
 This script evaluates the effectiveness of different scoring methods
 for membership inference attacks using extracted data.
+
+--- MODIFIED VERSION ---
+Scoring methods have been updated to be IDENTICAL to extract.py.
+Specifically, likelihood, zlib, metric, high_confidence, and min_k variants
+now operate ONLY on the 50-token suffix, not the full sequence.
 """
 
 import os
@@ -18,11 +23,12 @@ import zlib
 
 from utils import (
     load_model_and_tokenizer, get_scoring_methods, calculate_suffix_con_recall,
-    load_prompts, calculate_recall, calculate_con_recall
+    load_prompts, calculate_recall, calculate_con_recall,calculate_recall_scores
 )
 
 # Constants matching extract.py
 K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+SUFFIX_LEN = 50
 
 
 def load_guess_data(guess_file: str) -> pd.DataFrame:
@@ -56,59 +62,34 @@ def calculate_scores_for_evaluation(
         suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(device)
         full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
         
-        # Calculate recall scores (using prefix-suffix split)
-        # Unconditional: probability of suffix
-        suffix_outputs = model(suffix_ids)
-        suffix_logits = suffix_outputs.logits[:, :-1]
-        suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
-        suffix_token_log_probs = suffix_log_probs.gather(
-            dim=-1,
-            index=suffix_ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
-        ll_unconditional = suffix_token_log_probs.mean().item()
-        
-        # Conditional: probability of suffix given prefix
-        full_outputs = model(full_ids)
-        full_logits = full_outputs.logits[:, :-1]
-        full_log_probs = F.log_softmax(full_logits, dim=-1)
-        # Only gather probabilities for suffix positions
-        suffix_positions = torch.arange(50, len(guess)-1, device=device)
-        full_token_log_probs = full_log_probs[0, suffix_positions].gather(
-            dim=-1,
-            index=suffix_ids[0, 1:].unsqueeze(-1)
-        ).squeeze(-1)
-        ll_conditional = full_token_log_probs.mean().item()
-        
-        # Calculate suffix_recall score using the new formula
-        nll_unconditional = -ll_unconditional
-        nll_conditional = -ll_conditional
+        # --- Consistent Methods (No Change Needed) ---
+
+        # Suffix Recall (based on prefix/suffix relationship)
+        nll_unconditional = -calculate_recall_scores(prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, device)[0]
+        nll_conditional = -calculate_recall_scores(prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, device)[1]
         suffix_recall_score = nll_unconditional / nll_conditional if nll_conditional != 0 else 0
         scores['suffix_recall'].append(suffix_recall_score)
         
-        # Calculate suffix_con_recall score
+        # Suffix ConRecall (based on prefix/suffix relationship)
         s_con_recall_score = calculate_suffix_con_recall(
             prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, tokenizer, device
         )
         scores['suffix_conrecall'].append(s_con_recall_score)
 
-        # Calculate other scores using the full sequence
-        outputs = model(full_ids, labels=full_ids)
-        loss, logits = outputs[:2]
-        original_nll = loss.item()
+        # Recall and ConRecall (defined based on full sequence)
+        outputs = model(full_ids, labels=full_ids) # Need this for original_nll
+        original_nll = outputs.loss.item()
         
-        # Calculate recall and con_recall
         if non_member_prefix is not None:
             nm_prefix_idx = i % len(non_member_prefix)
             nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64).to(device)
             
-            # Recall score
             nll_u, nll_c = calculate_recall(
                 nm_prefix, prefix_ids.squeeze(0), suffix_ids.squeeze(0), model, device
             )
             recall_score = nll_c / nll_u if nll_u != 0 else 0
             scores['recall'].append(recall_score)
 
-            # Contrastive Recall score
             if member_prefix is not None:
                 m_prefix_idx = i % len(member_prefix)
                 m_prefix = torch.tensor(member_prefix[m_prefix_idx], dtype=torch.int64).to(device)
@@ -117,60 +98,97 @@ def calculate_scores_for_evaluation(
                     nm_prefix, m_prefix, full_ids.squeeze(0), original_nll, model, device
                 )
                 scores['con_recall'].append(con_recall_score)
+        
+        # Lowercase (defined based on full sequence)
+        original_nll_sum = F.cross_entropy(outputs.logits[0, :-1], full_ids[0, 1:], reduction='sum').item()
+        
+        decoded_text = tokenizer.decode(full_ids[0].cpu().numpy(), skip_special_tokens=True)
+        lowercase_text = decoded_text.lower()
+        lowercase_ids = tokenizer(lowercase_text, return_tensors='pt').input_ids.to(device)
+        
+        if lowercase_ids.shape[1] > 1:
+            lowercase_outputs = model(lowercase_ids, labels=lowercase_ids)
+            lowercase_nll = F.cross_entropy(lowercase_outputs.logits[0, :-1], lowercase_ids[0, 1:], reduction='sum').item()
+            lowercase_score = -original_nll_sum / (lowercase_nll + 1e-9)
+        else:
+            lowercase_score = 0
+        scores['lowercase'].append(lowercase_score)
 
-        # 1. Likelihood - keep original scale (log likelihood)
+
+        # --- MODIFICATION START: Suffix-only scoring for remaining methods ---
+        
+        # Re-use the forward pass from above
+        logits = outputs.logits
+
+        # 1. Likelihood (Suffix-only)
         log_probs_full = F.log_softmax(logits[0, :-1], dim=-1)
         token_log_probs_full = log_probs_full.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
-        ll = token_log_probs_full.mean().item()
+        
+        # Slice to get log-probs for the suffix only
+        suffix_token_log_probs = token_log_probs_full[-SUFFIX_LEN:]
+        ll = suffix_token_log_probs.mean().item()
         scores['likelihood'].append(ll)
         
-        # 2. Zlib
+        # 2. Zlib (Likelihood part is now suffix-only)
         text = tokenizer.decode(full_ids[0].cpu().numpy())
         compression_ratio = len(zlib.compress(text.encode('utf-8'))) / len(text.encode('utf-8'))
-        scores['zlib'].append(ll * compression_ratio)
+        scores['zlib'].append(ll * compression_ratio) # ll is now the suffix likelihood
         
-        # 3. Metric (mean with outlier removal)
-        loss_per_token = F.cross_entropy(
+        # Get loss per token for the full sequence first
+        full_loss_per_token = F.cross_entropy(
             logits[0, :-1], 
             full_ids[0, 1:], 
             reduction='none'
         ).cpu().numpy()
-        mean = np.mean(loss_per_token)
-        std = np.std(loss_per_token)
+        
+        # Slice to get loss for the suffix only
+        suffix_loss_per_token = full_loss_per_token[-SUFFIX_LEN:]
+
+        # 3. Metric (Suffix-only)
+        mean = np.mean(suffix_loss_per_token)
+        std = np.std(suffix_loss_per_token)
         floor = mean - 3*std
         upper = mean + 3*std
         metric_loss = np.where(
-            ((loss_per_token < floor) | (loss_per_token > upper)),
+            ((suffix_loss_per_token < floor) | (suffix_loss_per_token > upper)),
             mean,
-            loss_per_token
+            suffix_loss_per_token
         )
         scores['metric'].append(-np.mean(metric_loss))
         
-        # 4. High confidence
-        probs = F.softmax(logits[0, :-1], dim=-1)
+        # 4. High confidence (Suffix-only)
+        # Note: extract.py uses the mean of the *full* loss for adjustment. We replicate that.
+        full_mean_for_conf = np.mean(full_loss_per_token) 
+        
+        # Get flags for the suffix part of the logits
+        suffix_logits = logits[0, -SUFFIX_LEN-1:-1]
+        probs = F.softmax(suffix_logits, dim=-1)
         top_scores, _ = probs.topk(2, dim=-1)
         flag1 = (top_scores[:, 0] - top_scores[:, 1]) > 0.5
         flag2 = top_scores[:, 0] > 0
-        conf_adjustment = (flag1.int() - flag2.int()) * mean * 0.15
-        conf_loss = loss_per_token - conf_adjustment.cpu().numpy()
+        conf_adjustment = (flag1.int() - flag2.int()) * full_mean_for_conf * 0.15
+        conf_loss = suffix_loss_per_token - conf_adjustment.cpu().numpy()
         scores['high_confidence'].append(-np.mean(conf_loss))
         
-        # 5. Min-k, Min-k++, and Surprise scores
-        logits_shifted = logits[0, :-1]
-        log_probs = F.log_softmax(logits_shifted, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=full_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+        # 5. Min-k, Min-k++, and Surprise scores (Suffix-only)
+        # We already have suffix_token_log_probs from the likelihood calculation
         
-        mu = log_probs.mean(-1)
-        sigma = log_probs.std(-1)
-        mink_plus = (token_log_probs - mu) / sigma
+        # Calculate mu and sigma on suffix logits
+        suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
+        mu = suffix_log_probs.mean(-1)
+        sigma = suffix_log_probs.std(-1)
         
-        entropy = (-torch.exp(log_probs) * log_probs).sum(dim=-1)
+        # Note: mink_plus uses the log_probs of the *correct* tokens
+        correct_token_log_probs_suffix = token_log_probs_full[-SUFFIX_LEN:]
+        mink_plus = (correct_token_log_probs_suffix - mu) / sigma
+        
+        entropy = (-torch.exp(suffix_log_probs) * suffix_log_probs).sum(dim=-1)
         
         for ratio in K_RATIOS:
-            k_length = int(len(token_log_probs) * ratio)
+            k_length = int(len(correct_token_log_probs_suffix) * ratio)
             if k_length > 0:
                 # Min-k
-                topk_mink = np.sort(token_log_probs.cpu())[:k_length]
+                topk_mink = np.sort(correct_token_log_probs_suffix.cpu())[:k_length]
                 scores[f'min_k_{ratio}'].append(-np.mean(topk_mink).item())
                 
                 # Min-k++
@@ -178,12 +196,12 @@ def calculate_scores_for_evaluation(
                 scores[f'min_k_plus_{ratio}'].append(-np.mean(topk_mink_plus).item())
 
                 # Surprise
-                mink_idx = np.argsort(token_log_probs.cpu().numpy())[:k_length]
+                mink_idx = np.argsort(correct_token_log_probs_suffix.cpu().numpy())[:k_length]
                 entropy_idx = np.where(entropy.cpu().numpy() < 2.0)[0]
                 intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
                 
                 if len(intersection) > 0:
-                    score = np.mean(token_log_probs.cpu().numpy()[intersection])
+                    score = np.mean(correct_token_log_probs_suffix.cpu().numpy()[intersection])
                 else:
                     score = -100.0
                 scores[f'surprise_{ratio}'].append(score)
@@ -192,23 +210,8 @@ def calculate_scores_for_evaluation(
                 scores[f'min_k_{ratio}'].append(0.0)
                 scores[f'min_k_plus_{ratio}'].append(0.0)
                 scores[f'surprise_{ratio}'].append(0.0)
-        
-        # 6. Lowercase score
-        original_nll_sum = F.cross_entropy(logits[0, :-1], full_ids[0, 1:], reduction='sum').item()
-        
-        decoded_text = tokenizer.decode(full_ids[0].cpu().numpy(), skip_special_tokens=True)
-        lowercase_text = decoded_text.lower()
-        lowercase_ids = tokenizer(lowercase_text, return_tensors='pt').input_ids.to(device)
-        
-        if lowercase_ids.shape[1] > 1:
-            lowercase_outputs = model(lowercase_ids, labels=lowercase_ids)
-            lowercase_logits = lowercase_outputs.logits
-            lowercase_nll = F.cross_entropy(lowercase_logits[0, :-1], lowercase_ids[0, 1:], reduction='sum').item()
-            lowercase_score = -original_nll_sum / (lowercase_nll + 1e-9)
-        else:
-            lowercase_score = 0
-        scores['lowercase'].append(lowercase_score)
 
+        # --- MODIFICATION END ---
     return scores
 
 
