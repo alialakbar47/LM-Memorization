@@ -357,7 +357,7 @@ def calculate_lowercase_score(
 
 def write_guesses_to_csv(generations_per_prompt: int, 
                         generations_dict: Dict[str, np.ndarray], 
-                        answers: np.ndarray, 
+                        answers: List[np.ndarray], 
                         methods: List[str]):
     """Write guesses with ground truth labels to CSV files."""
     for method in methods:
@@ -370,7 +370,15 @@ def write_guesses_to_csv(generations_per_prompt: int,
             for example_id in range(len(generations_dict[method])):
                 guess = generations_dict[method][example_id]
                 ground_truth = answers[example_id]
-                is_correct = np.all(guess == ground_truth)
+                
+                # Handle variable lengths
+                l_gen = len(guess)
+                l_ans = len(ground_truth)
+                
+                if l_gen >= l_ans:
+                    is_correct = np.array_equal(guess[:l_ans], ground_truth)
+                else:
+                    is_correct = False
                 
                 row_output = [
                     example_id, 
@@ -382,18 +390,41 @@ def write_guesses_to_csv(generations_per_prompt: int,
 
 
 def calculate_metrics(generations_dict: Dict[str, np.ndarray], 
-                     answers: np.ndarray) -> Dict[str, Dict[str, float]]:
+                     answers: List[np.ndarray]) -> Dict[str, Dict[str, float]]:
     """Calculate various evaluation metrics."""
     results = {}
     
     for method in generations_dict:
         generations = generations_dict[method]
         
-        # Precision (exact match)
-        precision = np.sum(np.all(generations == answers, axis=-1)) / generations.shape[0]
+        num_correct = 0
+        total_hamming = 0
+        num_examples = len(generations)
         
-        # Hamming distance
-        hamming_dist = (answers != generations).sum(1).mean()
+        for i in range(num_examples):
+            gen = generations[i]
+            ans = answers[i]
+            
+            l_gen = len(gen)
+            l_ans = len(ans)
+            
+            # Precision: Check if generation starts with the answer
+            if l_gen >= l_ans:
+                match = np.array_equal(gen[:l_ans], ans)
+            else:
+                match = False
+                
+            if match:
+                num_correct += 1
+            
+            # Hamming distance
+            min_len = min(l_gen, l_ans)
+            diffs = np.sum(gen[:min_len] != ans[:min_len])
+            diffs += abs(l_gen - l_ans)
+            total_hamming += diffs
+        
+        precision = num_correct / num_examples
+        hamming_dist = total_hamming / num_examples
         
         results[method] = {
             'precision': precision,
