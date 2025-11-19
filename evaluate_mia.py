@@ -37,6 +37,7 @@ def load_guess_data(guess_file: str) -> pd.DataFrame:
 @torch.no_grad()
 def calculate_scores_for_evaluation(
     model, tokenizer, df: pd.DataFrame, device: torch.device,
+    train_prefix: np.ndarray,
     non_member_prefix: np.ndarray = None,
     member_prefix: np.ndarray = None
 ) -> dict:
@@ -45,16 +46,18 @@ def calculate_scores_for_evaluation(
     
     for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Calculating scores')):
         guess = np.array(row['Suffix Guess'])
-        ground_truth = np.array(row['Ground Truth'])
         
-        # Split into prefix and suffix (assuming 50-50 split)
-        prefix = guess[:50]
-        suffix = guess[50:]
+        example_id = int(row['Example ID'])
+        if example_id >= len(train_prefix):
+            continue
+            
+        prefix = train_prefix[example_id]
+        suffix = guess
         
         # Convert to tensors
         prefix_ids = torch.tensor(prefix, dtype=torch.int64).unsqueeze(0).to(device)
         suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(device)
-        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        full_ids = torch.cat([prefix_ids, suffix_ids], dim=1)
         
         # Calculate recall scores (using prefix-suffix split)
         # Unconditional: probability of suffix
@@ -71,13 +74,20 @@ def calculate_scores_for_evaluation(
         full_outputs = model(full_ids)
         full_logits = full_outputs.logits[:, :-1]
         full_log_probs = F.log_softmax(full_logits, dim=-1)
+        
         # Only gather probabilities for suffix positions
-        suffix_positions = torch.arange(50, len(guess)-1, device=device)
-        full_token_log_probs = full_log_probs[0, suffix_positions].gather(
-            dim=-1,
-            index=suffix_ids[0, 1:].unsqueeze(-1)
-        ).squeeze(-1)
-        ll_conditional = full_token_log_probs.mean().item()
+        # Suffix starts after prefix
+        prefix_len = prefix_ids.shape[1]
+        suffix_positions = torch.arange(prefix_len, full_ids.shape[1]-1, device=device)
+        
+        if len(suffix_positions) > 0:
+            full_token_log_probs = full_log_probs[0, suffix_positions].gather(
+                dim=-1,
+                index=suffix_ids[0, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            ll_conditional = full_token_log_probs.mean().item()
+        else:
+            ll_conditional = 0.0
         
         # Calculate suffix_recall score using the new formula
         nll_unconditional = -ll_unconditional
@@ -281,7 +291,18 @@ def run_mia_evaluation(args):
 
     # Load prefix data for recall and con_recall
     non_member_prefix, member_prefix = None, None
+    train_prefix = None
+    
     if args.dataset_dir:
+        try:
+            train_prefix = load_prompts(args.dataset_dir, "train_prefix.npy", allow_pickle=True)
+            if args.val_set_num > 0:
+                train_prefix = train_prefix[-args.val_set_num:]
+            print(f"Loaded train prefix from {args.dataset_dir}.")
+        except FileNotFoundError:
+            print(f"Error: train_prefix.npy not found in {args.dataset_dir}. Required for evaluation.")
+            return
+
         try:
             non_member_prefix = load_prompts(args.dataset_dir, "non_member_prefix.npy", allow_pickle=True)
             print(f"Loaded non-member prefix from {args.dataset_dir} for recall calculation.")
@@ -312,6 +333,7 @@ def run_mia_evaluation(args):
         # Calculate scores using all methods
         scores = calculate_scores_for_evaluation(
             model, tokenizer, df, device,
+            train_prefix=train_prefix,
             non_member_prefix=non_member_prefix,
             member_prefix=member_prefix
         )
@@ -391,6 +413,8 @@ def main():
                        help='Directory containing guess CSV files')
     parser.add_argument('--dataset_dir', type=str, default="../datasets",
                        help='Path to dataset directory for loading prefixes needed for some scores')
+    parser.add_argument('--val_set_num', type=int, default=1000,
+                       help='Number of validation examples to use (must match extraction)')
     
     # Processing arguments
     parser.add_argument('--batch_size', type=int, default=32,

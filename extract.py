@@ -27,14 +27,27 @@ from utils import (
 )
 
 # Constants
-SUFFIX_LEN = 50
-PREFIX_LEN = 50
 K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 MAX_ENTROPY = 2.0
 
 # Enable TF32 for faster computation on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+def pad_sequences_left(sequences: List[np.ndarray], pad_token_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad list of sequences to max length (left padding)."""
+    max_len = max(len(s) for s in sequences)
+    padded_seqs = []
+    attention_masks = []
+    for s in sequences:
+        pad_len = max_len - len(s)
+        padded = np.concatenate([np.full(pad_len, pad_token_id, dtype=s.dtype), s])
+        mask = np.concatenate([np.zeros(pad_len, dtype=np.int64), np.ones(len(s), dtype=np.int64)])
+        padded_seqs.append(padded)
+        attention_masks.append(mask)
+    
+    return torch.tensor(np.stack(padded_seqs), dtype=torch.long), torch.tensor(np.stack(attention_masks), dtype=torch.long)
 
 
 class CheckpointManager:
@@ -98,7 +111,7 @@ class CheckpointManager:
 
 
 @torch.no_grad()
-def generate_and_score(prompts: np.ndarray, 
+def generate_and_score(prompts: List[np.ndarray], 
                       model, 
                       tokenizer,
                       batch_size: int = 64,
@@ -124,14 +137,14 @@ def generate_and_score(prompts: np.ndarray,
     """
     if generation_params is None:
         generation_params = {
-            'max_length': SUFFIX_LEN + PREFIX_LEN,
+            'max_new_tokens': 50,
             'do_sample': True,
             'top_k': 10,
             'top_p': 1.0,
             'typical_p': 1.0,
             'temperature': 1.0,
             'repetition_penalty': 1.0,
-            'pad_token_id': 50256,
+            'pad_token_id': tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 50256,
             'use_cache': True
         }
     
@@ -142,19 +155,30 @@ def generate_and_score(prompts: np.ndarray,
     
     # Process prompts in batches
     for off in tqdm(range(0, len(prompts), batch_size), desc="Processing batches"):
-        prompt_batch = prompts[off:off + batch_size]
-        prompt_batch = np.stack(prompt_batch, axis=0)
-        input_ids = torch.tensor(prompt_batch, dtype=torch.int64, device=device)
+        batch_prompts = prompts[off:off + batch_size]
+        
+        # Pad batch
+        input_ids, attention_mask = pad_sequences_left(batch_prompts, tokenizer.pad_token_id)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        
+        # Calculate prefix lengths (without padding)
+        prefix_lens = [len(p) for p in batch_prompts]
         
         if not skip_generation:
             # Generate text continuations
             generated_tokens = model.generate(
                 input_ids,
-                attention_mask=torch.ones_like(input_ids),
+                attention_mask=attention_mask,
                 **generation_params
             )
         else:
             generated_tokens = input_ids
+        
+        # Determine suffix length (assuming fixed max_new_tokens for the batch)
+        gen_suffix_len = generated_tokens.shape[1] - input_ids.shape[1]
+        if gen_suffix_len == 0 and not skip_generation:
+             gen_suffix_len = 0
         
         # Forward pass for scoring
         outputs = model(generated_tokens, labels=generated_tokens)
@@ -163,11 +187,11 @@ def generate_and_score(prompts: np.ndarray,
         full_loss_per_token_flat = F.cross_entropy(full_logits, generated_tokens[:, 1:].flatten(), reduction='none')
 
         high_conf_scores = calculate_high_confidence_scores(
-            outputs.logits[:, :-1], full_loss_per_token_flat, SUFFIX_LEN
+            outputs.logits[:, :-1], full_loss_per_token_flat, gen_suffix_len
         )
         scores["high_confidence"].extend(high_conf_scores)
 
-        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -SUFFIX_LEN:]
+        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -gen_suffix_len:]
         likelihood = loss_per_token.mean(1)
         scores["likelihood"].extend(likelihood.cpu().numpy())
         
@@ -189,8 +213,10 @@ def generate_and_score(prompts: np.ndarray,
             }
             
             for batch_idx in range(generated_tokens.shape[0]):
-                input_toks = input_ids[batch_idx]
-                suffix_toks = generated_tokens[batch_idx, -SUFFIX_LEN:]
+                # Extract unpadded prefix and suffix
+                p_len = prefix_lens[batch_idx]
+                input_toks = input_ids[batch_idx, -p_len:]
+                suffix_toks = generated_tokens[batch_idx, -gen_suffix_len:]
                 
                 futures['suffix_recall'].append(executor.submit(
                     calculate_recall_scores, input_toks, suffix_toks, model, device
@@ -234,12 +260,12 @@ def generate_and_score(prompts: np.ndarray,
         token_log_probs, mink_plus = calculate_min_k_scores(logits_batch, input_ids_batch, device)
         
         for batch_idx in range(token_log_probs.shape[0]):
-            seq_token_log_probs = token_log_probs[batch_idx][-SUFFIX_LEN:]
-            seq_mink_plus = mink_plus[batch_idx][-SUFFIX_LEN:]
-            seq_entropy = entropy_batch[batch_idx][-SUFFIX_LEN:]
+            seq_token_log_probs = token_log_probs[batch_idx][-gen_suffix_len:]
+            seq_mink_plus = mink_plus[batch_idx][-gen_suffix_len:]
+            seq_entropy = entropy_batch[batch_idx][-gen_suffix_len:]
             
             for ratio in K_RATIOS:
-                k_length = int(SUFFIX_LEN * ratio)
+                k_length = int(gen_suffix_len * ratio)
                 if k_length == 0: continue
                 
                 scores[f'min_k_{ratio}'].append(np.mean(np.sort(seq_token_log_probs)[:k_length]))
@@ -252,10 +278,10 @@ def generate_and_score(prompts: np.ndarray,
                 surprise_score = np.mean(seq_token_log_probs[intersection]) if len(intersection) > 0 else -100.0
                 scores[f'surprise_{ratio}'].append(surprise_score)
 
-        generations.extend(generated_tokens.cpu().numpy())
+        generations.extend(generated_tokens[:, input_ids.shape[1]:].cpu().numpy())
     
     for ratio in K_RATIOS:
-        if int(SUFFIX_LEN * ratio) == 0:
+        if len(scores[f'min_k_{ratio}']) < len(prompts):
             num_missing = len(prompts) - len(scores[f'min_k_{ratio}'])
             scores[f'min_k_{ratio}'].extend([0.0] * num_missing)
             scores[f'min_k_plus_{ratio}'].extend([0.0] * num_missing)
@@ -333,7 +359,7 @@ def run_extraction(args):
         print("Warning: member_prefix.npy not found. `con_recall` will not be calculated.")
 
     generation_params = {
-        'max_length': SUFFIX_LEN + PREFIX_LEN,
+        'max_new_tokens': args.max_new_tokens,
         'do_sample': True,
         'top_k': args.top_k,
         'top_p': args.top_p,
@@ -389,7 +415,12 @@ def run_extraction(args):
     
     print(f"Generated shape: {all_generations.shape}")
     
-    answers = load_prompts(args.dataset_dir, "train_dataset.npy")[-args.val_set_num:, -100:]
+    full_answers = load_prompts(args.dataset_dir, "train_dataset.npy")[-args.val_set_num:]
+    answers = []
+    for i, full_seq in enumerate(full_answers):
+        prefix_len = len(prompts[i])
+        suffix = full_seq[prefix_len:]
+        answers.append(suffix)
 
     max_generations_per_prompt = all_generations.shape[1]
     gen_tiers = [1, 5, 10, 20, 50, max_generations_per_prompt]
@@ -473,6 +504,8 @@ def main():
                        help='Batch size for processing')
     
     # Generation parameters
+    parser.add_argument('--max_new_tokens', type=int, default=100,
+                       help='Maximum number of new tokens to generate')
     parser.add_argument('--top_k', type=int, default=50,
                        help='Top-k for generation')
     parser.add_argument('--top_p', type=float, default=1.0,
