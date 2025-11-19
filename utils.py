@@ -55,7 +55,11 @@ def load_prompts(dir_path: str, file_name: str, allow_pickle: bool = False) -> n
         if "allow_pickle=False" in str(e):
             data = np.load(os.path.join(dir_path, file_name), allow_pickle=True)
             if data.dtype == np.dtype('O'):
-                return np.array([np.array(x, dtype=np.int64) for x in data], dtype=np.int64)
+                converted = [np.array(x, dtype=np.int64) for x in data]
+                try:
+                    return np.array(converted, dtype=np.int64)
+                except ValueError:
+                    return np.array(converted, dtype=object)
             return data.astype(np.int64)
         raise
 
