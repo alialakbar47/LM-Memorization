@@ -2,6 +2,8 @@
 
 A comprehensive framework for evaluating membership inference attacks (MIA) on language models through data extraction using multiple scoring methods.
 
+> **🎉 New!** The repository has been refactored with a modular, configuration-driven architecture. See [`QUICKSTART.md`](QUICKSTART.md) and [`REFACTORING_GUIDE.md`](REFACTORING_GUIDE.md) for details. All existing functionality remains fully backward compatible.
+
 ## Overview
 
 This repository provides tools for:
@@ -48,6 +50,26 @@ python run_pipeline.py \
 
 ## Usage
 
+### Option 1: Configuration-Based Approach (New, Recommended)
+
+The repository now supports YAML-based configuration for easier experimentation:
+
+```bash
+# Edit config.yaml to customize metrics and hyperparameters
+python run_pipeline.py --config config.yaml
+```
+
+Benefits:
+
+- Enable/disable metrics without code changes
+- Easy hyperparameter tuning
+- Shareable experiment configurations
+- Modular metric system
+
+See [`QUICKSTART.md`](QUICKSTART.md) for details.
+
+### Option 2: Command-Line Arguments (Original)
+
 ### Data Extraction Only
 
 ```bash
@@ -79,19 +101,48 @@ Your dataset directory should contain:
 The framework implements the following scoring methods:
 
 ### Base Methods
+
 - **Likelihood**: Standard log-likelihood scoring
 - **Zlib**: Compression-based scoring
 - **Metric**: Likelihood with outlier removal
 - **High Confidence**: Confidence-adjusted scoring
 
 ### Recall Methods
+
 - **Recall**: Conditional vs unconditional likelihood
 - **Recall2/3**: Variations of recall scoring
 - **Original Recall**: Using non-member prefixes
 
 ### Min-k Methods
-- **Min-k**: Bottom-k token probabilities
+
+- **Min-k**: Bottom-k token probabilities at various ratios (0.1-1.0)
 - **Min-k++**: Normalized min-k scoring
+- **Surprise**: Min-k combined with entropy thresholding
+
+### Perturbation Methods
+
+- **Lowercase**: Case perturbation scoring
+
+## Project Structure
+
+```
+.
+├── metrics/                  # NEW: Modular metric implementations
+│   ├── __init__.py          # Abstract base class
+│   ├── likelihood.py        # Likelihood-based scoring
+│   ├── zlib.py             # Compression scoring
+│   ├── minkprob.py         # Min-k probability
+│   └── ...                 # Other metrics
+├── config.yaml              # NEW: Configuration file
+├── metric_loader.py         # NEW: Dynamic metric loading
+├── example_usage.py         # NEW: Usage example
+├── utils.py                 # Utility functions
+├── extract.py               # Data extraction script
+├── evaluate_mia.py          # MIA evaluation script
+├── run_pipeline.py          # Complete pipeline runner
+├── QUICKSTART.md            # NEW: Quick start guide
+└── REFACTORING_GUIDE.md     # NEW: Detailed refactoring docs
+```
 
 ## Configuration Options
 
@@ -112,11 +163,13 @@ The framework implements the following scoring methods:
 ## Output Files
 
 ### Extraction Output
+
 - `tmp/experiment_name/generations/`: Generated sequences
 - `tmp/experiment_name/losses/`: Scoring method results
 - `guess_*.csv`: Guess files with ground truth labels
 
 ### MIA Evaluation Output
+
 - `results/mia_evaluation/`: MIA evaluation results
 - Metrics include AUROC, FPR95, TPR05, Average Precision, and more
 

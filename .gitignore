@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Data files
+datasets/*.npy
+tmp/
+results/
+guess_files/
+*.csv
+*.npy
+*.pkl
+
+# Checkpoints
+checkpoint.pkl
+*.checkpoint
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Keep example structure but ignore data
+!datasets/.gitkeep
+!results/.gitkeep
+
+# Config backups
+config.*.bak
+*.yaml.bak
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Remove specific file
+New Text Document.txt
