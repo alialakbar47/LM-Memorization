@@ -36,6 +36,10 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Configuration file (NEW)
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to YAML configuration file (overrides other arguments)')
+    
     # Pipeline control
     parser.add_argument('--skip_extraction', action='store_true',
                        help='Skip extraction step and only run MIA evaluation')
@@ -92,6 +96,56 @@ def main():
                        help='Random seed for reproducibility')
     
     args = parser.parse_args()
+    
+    # Load configuration from YAML if provided
+    if args.config:
+        try:
+            from metric_loader import load_config
+            config = load_config(args.config)
+            
+            # Override args with config values (command-line args take precedence)
+            if 'global' in config:
+                global_config = config['global']
+                
+                # Only override if not explicitly set via command line
+                if args.dataset_dir == "../datasets" and 'dataset_dir' in global_config:
+                    args.dataset_dir = global_config['dataset_dir']
+                if args.model == 'EleutherAI/gpt-neo-1.3B' and 'model' in global_config:
+                    args.model = global_config['model']
+                if args.seed == 2022 and 'seed' in global_config:
+                    args.seed = global_config['seed']
+                if args.batch_size == 64 and 'batch_size' in global_config:
+                    args.batch_size = global_config['batch_size']
+                
+                # Generation parameters
+                if 'generation' in global_config:
+                    gen_config = global_config['generation']
+                    if args.num_trials == 5 and 'num_trials' in gen_config:
+                        args.num_trials = gen_config['num_trials']
+                    if args.val_set_num == 1000 and 'val_set_num' in gen_config:
+                        args.val_set_num = gen_config['val_set_num']
+                    if args.top_k == 50 and 'top_k' in gen_config:
+                        args.top_k = gen_config['top_k']
+                    if args.top_p == 1.0 and 'top_p' in gen_config:
+                        args.top_p = gen_config['top_p']
+                    if args.temperature == 1.0 and 'temperature' in gen_config:
+                        args.temperature = gen_config['temperature']
+                    if args.repetition_penalty == 1.0 and 'repetition_penalty' in gen_config:
+                        args.repetition_penalty = gen_config['repetition_penalty']
+                
+                # Output parameters
+                if 'output' in global_config:
+                    out_config = global_config['output']
+                    if args.experiment_name == 'pipeline_experiment' and 'experiment_name' in out_config:
+                        args.experiment_name = out_config['experiment_name']
+            
+            print("Configuration loaded from:", args.config)
+        except ImportError:
+            print("Warning: metric_loader not found. Install pyyaml: pip install pyyaml")
+            print("Falling back to command-line arguments only.")
+        except Exception as e:
+            print(f"Warning: Failed to load config from {args.config}: {e}")
+            print("Falling back to command-line arguments only.")
     
     print("LLM Data Extraction and MIA Evaluation Pipeline")
     print("=" * 60)
