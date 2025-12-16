@@ -19,18 +19,13 @@ from tqdm import tqdm
 
 from utils import (
     init_seeds, load_model_and_tokenizer, load_prompts, write_array,
-    prepare_directories, calculate_recall_scores, calculate_suffix_con_recall,
-    calculate_recall, calculate_con_recall, calculate_min_k_scores, calculate_zlib_scores,
-    calculate_metric_scores, calculate_high_confidence_scores, calculate_lowercase_score,
-    write_guesses_to_csv, calculate_metrics, get_scoring_methods, 
-    get_argmin_methods, get_argmax_methods
+    prepare_directories, write_guesses_to_csv
 )
+from metric_loader import load_config, load_all_enabled_metrics, get_enabled_metrics, update_metric_config_from_dataset
 
-# Constants
+# Constants (can be overridden by config)
 SUFFIX_LEN = 50
 PREFIX_LEN = 50
-K_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-MAX_ENTROPY = 2.0
 
 # Enable TF32 for faster computation on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -97,26 +92,51 @@ class CheckpointManager:
                 torch.cuda.set_rng_state_all(rng_states['torch_cuda_random'])
 
 
+def calculate_extraction_metrics(generations_dict: Dict, answers: np.ndarray) -> Dict:
+    """Calculate extraction metrics for each method's generations."""
+    metrics_dict = {}
+    
+    for method, generations in generations_dict.items():
+        decoded_generations = [
+            bytes(generation[generation != 0].tolist()).decode('utf-8', errors='ignore')
+            for generation in generations
+        ]
+        decoded_answers = [
+            bytes(answer[answer != 0].tolist()).decode('utf-8', errors='ignore')
+            for answer in answers
+        ]
+        
+        correct = sum(1 for gen, ans in zip(decoded_generations, decoded_answers) if gen == ans)
+        total = len(decoded_answers)
+        accuracy = correct / total if total > 0 else 0.0
+        
+        metrics_dict[method] = {
+            'correct': correct,
+            'total': total,
+            'accuracy': accuracy
+        }
+    
+    return metrics_dict
+
+
 @torch.no_grad()
 def generate_and_score(prompts: np.ndarray, 
                       model, 
                       tokenizer,
+                      metrics: Dict,
                       batch_size: int = 64,
                       skip_generation: bool = False,
-                      non_member_prefix: np.ndarray = None,
-                      member_prefix: np.ndarray = None,
                       generation_params: Dict = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
-    Generate text continuations and calculate all scoring metrics.
+    Generate text continuations and calculate all scoring metrics using modular metric system.
     
     Args:
         prompts: Input prompts for generation
         model: Language model
         tokenizer: Tokenizer
+        metrics: Dictionary of metric objects from metric_loader
         batch_size: Batch size for processing
         skip_generation: If True, use prompts as generations (for evaluation)
-        non_member_prefix: Non-member prefixes for recall calculation
-        member_prefix: Member prefixes for con_recall calculation
         generation_params: Parameters for text generation
     
     Returns:
@@ -136,9 +156,8 @@ def generate_and_score(prompts: np.ndarray,
         }
     
     device = next(model.parameters()).device
-    scoring_methods = get_scoring_methods(K_RATIOS)
     generations = []
-    scores = {method: [] for method in scoring_methods}
+    scores = {metric_name: [] for metric_name in metrics.keys()}
     
     # Process prompts in batches
     for off in tqdm(range(0, len(prompts), batch_size), desc="Processing batches"):
@@ -156,113 +175,24 @@ def generate_and_score(prompts: np.ndarray,
         else:
             generated_tokens = input_ids
         
-        # Forward pass for scoring
-        outputs = model(generated_tokens, labels=generated_tokens)
-        
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token_flat = F.cross_entropy(full_logits, generated_tokens[:, 1:].flatten(), reduction='none')
-
-        high_conf_scores = calculate_high_confidence_scores(
-            outputs.logits[:, :-1], full_loss_per_token_flat, SUFFIX_LEN
-        )
-        scores["high_confidence"].extend(high_conf_scores)
-
-        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -SUFFIX_LEN:]
-        likelihood = loss_per_token.mean(1)
-        scores["likelihood"].extend(likelihood.cpu().numpy())
-        
-        scores["zlib"].extend(calculate_zlib_scores(generated_tokens, likelihood))
-        scores["metric"].extend(calculate_metric_scores(loss_per_token))
-        
-        # Calculate normalized NLL for lowercase and con_recall
-        full_labels = generated_tokens[:, 1:].contiguous()
-        mask = (full_labels != tokenizer.pad_token_id).float()
-        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
-        scores["lowercase"].extend(calculate_lowercase_score(
-            generated_tokens, original_nlls, model, tokenizer, device
-        ))
-
-        # Calculate various recall scores using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {
-                'suffix_recall': [], 'recall': [], 'con_recall': [], 'suffix_conrecall': []
-            }
-            
-            for batch_idx in range(generated_tokens.shape[0]):
-                input_toks = input_ids[batch_idx]
-                suffix_toks = generated_tokens[batch_idx, -SUFFIX_LEN:]
-                
-                futures['suffix_recall'].append(executor.submit(
-                    calculate_recall_scores, input_toks, suffix_toks, model, device
-                ))
-                futures['suffix_conrecall'].append(executor.submit(
-                calculate_suffix_con_recall, input_toks, suffix_toks, model, tokenizer, device,
-                non_member_prefix, off + batch_idx
-                ))
-                
-                if non_member_prefix is not None:
-                    nm_prefix = torch.tensor(non_member_prefix[batch_idx % len(non_member_prefix)], dtype=torch.int64)
-                    futures['recall'].append(executor.submit(
-                        calculate_recall, nm_prefix, input_toks, suffix_toks, model, device
-                    ))
-                    
-                    if member_prefix is not None:
-                        m_prefix = torch.tensor(member_prefix[batch_idx % len(member_prefix)], dtype=torch.int64)
-                        futures['con_recall'].append(executor.submit(
-                            calculate_con_recall, nm_prefix, m_prefix,
-                            generated_tokens[batch_idx], original_nlls[batch_idx].item(),
-                            model, device
-                        ))
-
-            for ll_u, ll_c in [f.result() for f in futures['suffix_recall']]:
-                nll_unconditional = -ll_u
-                nll_conditional = -ll_c
-                scores["suffix_recall"].append(nll_unconditional / nll_conditional if nll_conditional != 0 else 0)
-            for score in [f.result() for f in futures['suffix_conrecall']]:
-                scores["suffix_conrecall"].append(score)
-            for nll_u, nll_c in [f.result() for f in futures['recall']]:
-                scores["recall"].append(nll_c / nll_u if nll_u != 0 else 0)
-            for score in [f.result() for f in futures['con_recall']]:
-                scores["con_recall"].append(score)
-
-        # Calculate min_k, min_k_plus, and surprise scores
-        logits_batch = outputs.logits[:, :-1]
-        log_probs_batch = F.log_softmax(logits_batch, dim=-1)
-        entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
-        
-        input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
-        token_log_probs, mink_plus = calculate_min_k_scores(logits_batch, input_ids_batch, device)
-        
-        for batch_idx in range(token_log_probs.shape[0]):
-            seq_token_log_probs = token_log_probs[batch_idx][-SUFFIX_LEN:]
-            seq_mink_plus = mink_plus[batch_idx][-SUFFIX_LEN:]
-            seq_entropy = entropy_batch[batch_idx][-SUFFIX_LEN:]
-            
-            for ratio in K_RATIOS:
-                k_length = int(SUFFIX_LEN * ratio)
-                if k_length == 0: continue
-                
-                scores[f'min_k_{ratio}'].append(np.mean(np.sort(seq_token_log_probs)[:k_length]))
-                scores[f'min_k_plus_{ratio}'].append(np.mean(np.sort(seq_mink_plus)[:k_length]))
-
-                mink_idx = np.argsort(seq_token_log_probs)[:k_length]
-                entropy_idx = np.where(seq_entropy.cpu().numpy() < MAX_ENTROPY)[0]
-                intersection = np.intersect1d(mink_idx, entropy_idx, assume_unique=True)
-
-                surprise_score = np.mean(seq_token_log_probs[intersection]) if len(intersection) > 0 else -100.0
-                scores[f'surprise_{ratio}'].append(surprise_score)
+        # Calculate scores using each metric
+        for metric_name, metric_obj in metrics.items():
+            try:
+                batch_scores = metric_obj.compute_score(
+                    generated_tokens=generated_tokens,
+                    prefix_len=PREFIX_LEN,
+                    suffix_len=SUFFIX_LEN
+                )
+                scores[metric_name].extend(batch_scores.cpu().numpy() if torch.is_tensor(batch_scores) else batch_scores)
+            except Exception as e:
+                print(f"Warning: Error computing {metric_name}: {e}")
+                # Add zero scores for this batch
+                scores[metric_name].extend([0.0] * generated_tokens.shape[0])
 
         generations.extend(generated_tokens.cpu().numpy())
     
-    for ratio in K_RATIOS:
-        if int(SUFFIX_LEN * ratio) == 0:
-            num_missing = len(prompts) - len(scores[f'min_k_{ratio}'])
-            scores[f'min_k_{ratio}'].extend([0.0] * num_missing)
-            scores[f'min_k_plus_{ratio}'].extend([0.0] * num_missing)
-            scores[f'surprise_{ratio}'].extend([0.0] * num_missing)
-
     generations = np.array(generations)
-    for method in scoring_methods:
+    for method in metrics.keys():
         if scores[method]:
             scores[method] = np.array(scores[method])
     
@@ -272,6 +202,31 @@ def generate_and_score(prompts: np.ndarray,
 def run_extraction(args):
     """Main extraction pipeline with checkpoint/resume capability."""
     print(f"Starting extraction with {args.model}")
+    
+    # Load configuration if provided
+    if hasattr(args, 'config') and args.config:
+        print(f"Loading configuration from {args.config}")
+        config = load_config(args.config)
+        
+        # Update config with dataset paths
+        dataset_paths = {
+            'non_member_prefix': os.path.join(args.dataset_dir, 'non_member_prefix.npy'),
+            'member_prefix': os.path.join(args.dataset_dir, 'member_prefix.npy')
+        }
+        config = update_metric_config_from_dataset(config, dataset_paths)
+    else:
+        # Use default config
+        print("Loading default configuration from config.yaml")
+        try:
+            config = load_config('config.yaml')
+            dataset_paths = {
+                'non_member_prefix': os.path.join(args.dataset_dir, 'non_member_prefix.npy'),
+                'member_prefix': os.path.join(args.dataset_dir, 'member_prefix.npy')
+            }
+            config = update_metric_config_from_dataset(config, dataset_paths)
+        except Exception as e:
+            print(f"Warning: Could not load config.yaml: {e}")
+            config = None
     
     # Initialize directories first - now under results/experiment-name/
     experiment_base, generations_base, losses_base = prepare_directories(
@@ -313,24 +268,25 @@ def run_extraction(args):
         init_seeds(args.seed)
         start_trial = 0
         all_generations = []
-        all_scores = {method: [] for method in get_scoring_methods(K_RATIOS)}
+        all_scores = {}
     
     # Load model and data (this should be after RNG state restoration for consistency)
     model, tokenizer = load_model_and_tokenizer(args.model)
     
-    prompts = load_prompts(args.dataset_dir, "train_prefix.npy")[-args.val_set_num:]
+    # Load metrics using metric_loader
+    if config:
+        metrics = load_all_enabled_metrics(model, tokenizer, config)
+        print(f"Loaded {len(metrics)} metrics: {list(metrics.keys())}")
+    else:
+        print("Error: No configuration available. Cannot load metrics.")
+        print("Please ensure config.yaml exists or provide --config argument.")
+        return
     
-    non_member_prefix, member_prefix = None, None
-    try:
-        non_member_prefix = load_prompts(args.dataset_dir, "non_member_prefix.npy", allow_pickle=True)
-        print("Loaded non-member prefix for recall calculation.")
-    except FileNotFoundError:
-        print("Warning: non_member_prefix.npy not found. `recall` and `con_recall` will not be calculated.")
-    try:
-        member_prefix = load_prompts(args.dataset_dir, "member_prefix.npy", allow_pickle=True)
-        print("Loaded member prefix for con_recall calculation.")
-    except FileNotFoundError:
-        print("Warning: member_prefix.npy not found. `con_recall` will not be calculated.")
+    # Initialize scores if starting fresh
+    if not all_scores:
+        all_scores = {name: [] for name in metrics.keys()}
+    
+    prompts = load_prompts(args.dataset_dir, "train_prefix.npy")[-args.val_set_num:]
 
     generation_params = {
         'max_length': SUFFIX_LEN + PREFIX_LEN,
@@ -344,7 +300,7 @@ def run_extraction(args):
         'use_cache': True
     }
     
-    scoring_methods = get_scoring_methods(K_RATIOS)
+    scoring_methods = list(metrics.keys())
     
     # Continue from where we left off
     for trial in range(start_trial, args.num_trials):
@@ -354,9 +310,8 @@ def run_extraction(args):
             prompts=prompts,
             model=model,
             tokenizer=tokenizer,
+            metrics=metrics,
             batch_size=args.batch_size,
-            non_member_prefix=non_member_prefix,
-            member_prefix=member_prefix,
             generation_params=generation_params
         )
         
@@ -413,8 +368,9 @@ def run_extraction(args):
         generations_dict = {}
         
         valid_methods = [m for m in scoring_methods if all_scores.get(m) is not None and len(all_scores[m]) > 0]
-        argmin_methods = get_argmin_methods()
-        argmax_methods = get_argmax_methods(K_RATIOS)
+        # Determine argmin/argmax based on metric properties
+        argmin_methods = [name for name, metric in metrics.items() if metric.uses_argmin()]
+        argmax_methods = [name for name, metric in metrics.items() if metric.uses_argmax()]
         
         for method in valid_methods:
             limited_scores = all_scores[method][:, :generations_per_prompt]
@@ -430,8 +386,8 @@ def run_extraction(args):
                 # Updated to save in the experiment's guess_files directory
                 write_guesses_to_csv(generations_per_prompt, generations_dict, answers, methods_to_save_csv, guess_files_dir)
         
-        metrics = calculate_metrics(generations_dict, answers)
-        for method, method_metrics in metrics.items():
+        metrics_dict = calculate_extraction_metrics(generations_dict, answers)
+        for method, method_metrics in metrics_dict.items():
             all_metrics_data.append({
                 'generations_per_prompt': generations_per_prompt,
                 'method': method,
@@ -456,6 +412,10 @@ def run_extraction(args):
 
 def main():
     parser = argparse.ArgumentParser(description="LLM Data Extraction with Multiple Scoring Methods")
+    
+    # Configuration arguments
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to YAML configuration file')
     
     # Data arguments
     parser.add_argument('--dataset_dir', type=str, default="../datasets", 
