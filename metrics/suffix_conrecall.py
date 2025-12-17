@@ -8,7 +8,7 @@ from metrics import AbstractMetric
 from typing import Dict, Any
 
 
-class SuffixConRecallMetric(AbstractMetric):
+class SuffixConrecallMetric(AbstractMetric):
     def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
         super().__init__(name, model, tokenizer, config)
         self.non_member_prefix_pool = config.get('non_member_prefix_pool', None)

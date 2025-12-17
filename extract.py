@@ -418,7 +418,7 @@ def main():
                        help='Path to YAML configuration file')
     
     # Data arguments
-    parser.add_argument('--dataset_dir', type=str, default="../datasets", 
+    parser.add_argument('--dataset_dir', type=str, default="datasets", 
                        help='Path to dataset directory')
     parser.add_argument('--experiment_name', type=str, default='extraction_experiment',
                        help='Name of the experiment')

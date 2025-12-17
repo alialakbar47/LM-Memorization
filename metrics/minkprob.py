@@ -9,7 +9,7 @@ from metrics import AbstractMetric
 from typing import Dict, Any
 
 
-class MinKProbMetric(AbstractMetric):
+class MinkprobMetric(AbstractMetric):
     def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
         super().__init__(name, model, tokenizer, config)
         self.k_ratio = config.get('k_ratio', 0.2)

@@ -89,15 +89,13 @@ metrics:
   con_recall:
     module: "con_recall"
     enabled: true
-    config:
-      # non_member_prefix_pool and member_prefix_pool will be loaded from dataset
+    config: {}
 
   suffix_conrecall:
     module: "suffix_conrecall"
     enabled: true
     config:
       prefix_len: 50
-      # non_member_prefix_pool will be loaded from dataset
 
   # Min-k based metrics (multiple k ratios)
   min_k_0.1:
