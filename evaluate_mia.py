@@ -29,59 +29,83 @@ def load_guess_data(guess_file: str) -> pd.DataFrame:
 def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame, 
                                    device: torch.device,
                                    metrics_list: list,
+                                   suffix_len: int,
                                    non_member_prefix: np.ndarray = None,
                                    member_prefix: np.ndarray = None) -> dict:
     """Calculate scores for MIA evaluation."""
+    import torch.nn.functional as F
     scores = defaultdict(list)
     
     for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Calculating scores')):
         guess = np.array(row['Suffix Guess'])
         
         # Convert to tensor
-        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        generated_tokens = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        
+        # Assume prefix and suffix split
+        input_ids = generated_tokens[:, :-suffix_len] if generated_tokens.shape[1] > suffix_len else generated_tokens[:, :1]
         
         # Forward pass
-        outputs = model(full_ids, labels=full_ids)
+        outputs = model(generated_tokens, labels=generated_tokens)
         
-        # Calculate normalized NLL
-        full_labels = full_ids[:, 1:].contiguous()
-        mask = (full_labels != tokenizer.pad_token_id).float()
+        # ===== Compute all shared values (same as extract.py) =====
+        # Logits and labels
+        logits = outputs.logits[:, :-1].contiguous()
+        labels = generated_tokens[:, 1:].contiguous()
         
-        import torch.nn.functional as F
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        # Reshape for loss calculation
+        full_logits_flat = logits.reshape((-1, logits.shape[-1])).float()
+        labels_flat = labels.flatten()
+        
+        # Loss per token
         full_loss_per_token_flat = F.cross_entropy(
-            full_logits,
-            full_ids[:, 1:].flatten(),
+            full_logits_flat,
+            labels_flat,
             reduction='none'
         )
-        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
+        loss_per_token = full_loss_per_token_flat.reshape(labels.shape)
         
-        # Get non-member and member prefixes
-        nm_prefix = None
-        m_prefix = None
-        if non_member_prefix is not None:
-            nm_prefix_idx = i % len(non_member_prefix)
-            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64).to(device)
-        if member_prefix is not None:
-            m_prefix_idx = i % len(member_prefix)
-            m_prefix = torch.tensor(member_prefix[m_prefix_idx], dtype=torch.int64).to(device)
+        # Log probabilities
+        log_probs_batch = F.log_softmax(logits, dim=-1)
+        input_ids_batch = labels.unsqueeze(-1)
+        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
         
-        # Compute each metric
+        # Mu and sigma for min-k++
+        mu = log_probs_batch.mean(dim=-1)
+        sigma = log_probs_batch.std(dim=-1)
+        
+        # Mask and normalized NLL
+        mask = (labels != tokenizer.pad_token_id).float()
+        original_nlls = (loss_per_token * mask).sum(dim=1) / mask.sum(dim=1)
+        
+        # Build shared context (same as extract.py)
+        shared_context = {
+            'generated_tokens': generated_tokens,
+            'input_ids': input_ids,
+            'outputs': outputs,
+            'logits': logits,
+            'labels': labels,
+            'loss_per_token': loss_per_token,
+            'full_loss_per_token_flat': full_loss_per_token_flat,
+            'log_probs_batch': log_probs_batch,
+            'token_log_probs': token_log_probs,
+            'mu': mu,
+            'sigma': sigma,
+            'mask': mask,
+            'original_nlls': original_nlls,
+            'suffix_len': suffix_len,
+            'non_member_prefix': non_member_prefix,
+            'member_prefix': member_prefix,
+            'batch_offset': i,
+        }
+        
+        # Compute each metric using shared context
         for metric in metrics_list:
-            metric_kwargs = {
-                'input_ids': full_ids[:, :50],  # Assuming 50-50 split
-                'suffix_len': 50,
-                'non_member_prefix': non_member_prefix,
-                'member_prefix': member_prefix,
-                'original_nlls': original_nlls,
-                'batch_offset': i,
-            }
-            
             try:
-                metric_score = metric.compute(
-                    model, tokenizer, full_ids, outputs, device, **metric_kwargs
-                )
+                metric_score = metric.compute(model, tokenizer, device, shared_context)
                 if isinstance(metric_score, np.ndarray):
+                    scores[metric.name].append(metric_score[0])
+                elif isinstance(metric_score, list):
                     scores[metric.name].append(metric_score[0])
                 else:
                     scores[metric.name].append(metric_score)
@@ -117,7 +141,8 @@ def run_mia_evaluation(config: Config):
     # Get all metrics
     metrics_list = get_all_metrics(
         k_ratios=config.metrics.k_ratios,
-        suffix_len=50
+        suffix_len=config.metrics.suffix_len,
+        max_entropy=config.metrics.max_entropy
     )
     
     # Process each guess file
@@ -137,6 +162,7 @@ def run_mia_evaluation(config: Config):
         scores = calculate_scores_for_evaluation(
             model, tokenizer, df, device,
             metrics_list=metrics_list,
+            suffix_len=config.metrics.suffix_len,
             non_member_prefix=non_member_prefix,
             member_prefix=member_prefix
         )
