@@ -18,33 +18,33 @@ class HighConfidenceMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute high confidence scores."""
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token_flat = F.cross_entropy(
-            full_logits, 
-            generated_tokens[:, 1:].flatten(), 
-            reduction='none'
-        )
+        # Use pre-computed values from shared context
+        logits = shared_context['logits']  # Shape: [batch, seq_len-1, vocab]
+        full_loss_per_token_flat = shared_context['full_loss_per_token_flat']  # Shape: [batch * seq_len]
+        suffix_len = shared_context['suffix_len']
         
-        # Get suffix logits and compute flags
-        suffix_logits = outputs.logits[:, -self.suffix_len-1:-1]
-        top_scores, _ = suffix_logits.topk(2, dim=-1)
+        # Compute flags on the full logits (before suffix extraction)
+        # This matches the old implementation exactly
+        top_scores, _ = logits.topk(2, dim=-1)  # Shape: [batch, seq_len-1, 2]
         flag1 = (top_scores[:, :, 0] - top_scores[:, :, 1]) > 0.5
         flag2 = top_scores[:, :, 0] > 0
-        flat_flag1 = flag1.reshape(-1)
+        flat_flag1 = flag1.reshape(-1)  # Flatten to match full_loss_per_token_flat
         flat_flag2 = flag2.reshape(-1)
         
         # Calculate mean batch loss for adjustment
         mean_batch_loss = full_loss_per_token_flat.mean()
         
-        # Apply adjustment
+        # Apply adjustment to the full flat loss (EXACT OLD LOGIC)
         loss_adjusted_flat = full_loss_per_token_flat - (flat_flag1.int() - flat_flag2.int()) * mean_batch_loss * 0.15
-        loss_adjusted_reshaped = loss_adjusted_flat.reshape(outputs.logits.shape[0], -1)
-        loss_adjusted_suffix = loss_adjusted_reshaped[:, -self.suffix_len:]
+        
+        # Reshape back to [batch, seq_len-1] and extract suffix
+        batch_size = logits.shape[0]
+        seq_len = logits.shape[1]
+        loss_adjusted_reshaped = loss_adjusted_flat.reshape(batch_size, seq_len)
+        loss_adjusted_suffix = loss_adjusted_reshaped[:, -suffix_len:]
         
         return loss_adjusted_suffix.mean(1).cpu().numpy()
     

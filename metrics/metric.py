@@ -18,20 +18,16 @@ class MetricMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute metric scores with outlier removal."""
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token_flat = F.cross_entropy(
-            full_logits, 
-            generated_tokens[:, 1:].flatten(), 
-            reduction='none'
-        )
+        # Use pre-computed loss_per_token from shared context
+        loss_per_token = shared_context['loss_per_token']
+        suffix_len = shared_context['suffix_len']
         
-        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -self.suffix_len:]
-        loss_per_token_np = loss_per_token.cpu().numpy()
+        # Extract suffix portion
+        loss_per_token_suffix = loss_per_token[:, -suffix_len:]
+        loss_per_token_np = loss_per_token_suffix.cpu().numpy()
         
         # Outlier removal
         mean = np.mean(loss_per_token_np, axis=-1, keepdims=True)

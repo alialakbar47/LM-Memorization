@@ -19,22 +19,18 @@ class MinKMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute min-k scores."""
-        logits_batch = outputs.logits[:, :-1]
-        log_probs_batch = F.log_softmax(logits_batch, dim=-1)
-        
-        input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
-        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
+        # Use pre-computed token_log_probs from shared context
+        token_log_probs = shared_context['token_log_probs']
+        suffix_len = shared_context['suffix_len']
         
         scores = []
         for batch_idx in range(token_log_probs.shape[0]):
-            seq_token_log_probs = token_log_probs[batch_idx][-self.suffix_len:].cpu().numpy()
+            seq_token_log_probs = token_log_probs[batch_idx][-suffix_len:].cpu().numpy()
             
-            k_length = int(self.suffix_len * self.ratio)
+            k_length = int(suffix_len * self.ratio)
             if k_length == 0:
                 scores.append(0.0)
             else:
@@ -58,28 +54,23 @@ class MinKPlusMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute min-k++ scores."""
-        logits_batch = outputs.logits[:, :-1]
-        log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+        # Use pre-computed values from shared context
+        token_log_probs = shared_context['token_log_probs']
+        mu = shared_context['mu']
+        sigma = shared_context['sigma']
+        suffix_len = shared_context['suffix_len']
         
-        input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
-        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
-        
-        # Calculate mu and sigma
-        mu = log_probs_batch.mean(dim=-1)
-        sigma = log_probs_batch.std(dim=-1)
-        
+        # Calculate normalized scores
         mink_plus = (token_log_probs - mu) / sigma
         
         scores = []
         for batch_idx in range(mink_plus.shape[0]):
-            seq_mink_plus = mink_plus[batch_idx][-self.suffix_len:].cpu().numpy()
+            seq_mink_plus = mink_plus[batch_idx][-suffix_len:].cpu().numpy()
             
-            k_length = int(self.suffix_len * self.ratio)
+            k_length = int(suffix_len * self.ratio)
             if k_length == 0:
                 scores.append(0.0)
             else:
@@ -104,26 +95,23 @@ class SurpriseMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute surprise scores."""
-        logits_batch = outputs.logits[:, :-1]
-        log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+        # Use pre-computed values from shared context
+        token_log_probs = shared_context['token_log_probs']
+        log_probs_batch = shared_context['log_probs_batch']
+        suffix_len = shared_context['suffix_len']
         
-        input_ids_batch = generated_tokens[:, 1:].unsqueeze(-1)
-        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
-        
-        # Calculate entropy
+        # Calculate entropy (only thing we can't pre-compute for all metrics)
         entropy_batch = (-torch.exp(log_probs_batch) * log_probs_batch).sum(dim=-1)
         
         scores = []
         for batch_idx in range(token_log_probs.shape[0]):
-            seq_token_log_probs = token_log_probs[batch_idx][-self.suffix_len:].cpu().numpy()
-            seq_entropy = entropy_batch[batch_idx][-self.suffix_len:].cpu().numpy()
+            seq_token_log_probs = token_log_probs[batch_idx][-suffix_len:].cpu().numpy()
+            seq_entropy = entropy_batch[batch_idx][-suffix_len:].cpu().numpy()
             
-            k_length = int(self.suffix_len * self.ratio)
+            k_length = int(suffix_len * self.ratio)
             if k_length == 0:
                 scores.append(0.0)
             else:

@@ -68,46 +68,66 @@ def generate_and_score(prompts: np.ndarray,
         else:
             generated_tokens = input_ids
         
-        # Forward pass for scoring
+        # Forward pass for scoring (ONCE!)
         outputs = model(generated_tokens, labels=generated_tokens)
         
-        # Calculate normalized NLL for metrics that need it
-        full_labels = generated_tokens[:, 1:].contiguous()
-        mask = (full_labels != tokenizer.pad_token_id).float()
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        # ===== Compute all shared values ONCE =====
+        # Logits and labels
+        logits = outputs.logits[:, :-1].contiguous()
+        labels = generated_tokens[:, 1:].contiguous()
+        
+        # Reshape for loss calculation
+        full_logits_flat = logits.reshape((-1, logits.shape[-1])).float()
+        labels_flat = labels.flatten()
+        
+        # Loss per token (ONCE!)
         full_loss_per_token_flat = F.cross_entropy(
-            full_logits,
-            generated_tokens[:, 1:].flatten(),
+            full_logits_flat,
+            labels_flat,
             reduction='none'
         )
-        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
+        loss_per_token = full_loss_per_token_flat.reshape(labels.shape)
         
-        # Compute metrics using ThreadPoolExecutor for recall-based metrics
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            for metric in metrics_list:
-                # Build kwargs for metric computation
-                metric_kwargs = {
-                    'input_ids': input_ids,
-                    'suffix_len': config.metrics.suffix_len,
-                    'non_member_prefix': non_member_prefix,
-                    'member_prefix': member_prefix,
-                    'original_nlls': original_nlls,
-                    'batch_offset': off + batch_offset,
-                }
-                
-                # Compute metric scores
-                if metric.name in ['suffix_recall', 'recall', 'con_recall', 'suffix_conrecall']:
-                    # These metrics require sequential processing
-                    metric_scores = metric.compute(
-                        model, tokenizer, generated_tokens, outputs, device, **metric_kwargs
-                    )
-                else:
-                    # Other metrics can be computed in batch
-                    metric_scores = metric.compute(
-                        model, tokenizer, generated_tokens, outputs, device, **metric_kwargs
-                    )
-                
-                scores[metric.name].extend(metric_scores)
+        # Log probabilities (ONCE!)
+        log_probs_batch = F.log_softmax(logits, dim=-1)
+        input_ids_batch = labels.unsqueeze(-1)
+        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
+        
+        # Mu and sigma for min-k++ (ONCE!)
+        mu = log_probs_batch.mean(dim=-1)
+        sigma = log_probs_batch.std(dim=-1)
+        
+        # Mask and normalized NLL (ONCE!)
+        mask = (labels != tokenizer.pad_token_id).float()
+        original_nlls = (loss_per_token * mask).sum(dim=1) / mask.sum(dim=1)
+        
+        # Build shared context with all pre-computed values
+        shared_context = {
+            'generated_tokens': generated_tokens,
+            'input_ids': input_ids,
+            'outputs': outputs,
+            'logits': logits,
+            'labels': labels,
+            'loss_per_token': loss_per_token,
+            'full_loss_per_token_flat': full_loss_per_token_flat,
+            'log_probs_batch': log_probs_batch,
+            'token_log_probs': token_log_probs,
+            'mu': mu,
+            'sigma': sigma,
+            'mask': mask,
+            'original_nlls': original_nlls,
+            'suffix_len': config.metrics.suffix_len,
+            'non_member_prefix': non_member_prefix,
+            'member_prefix': member_prefix,
+            'batch_offset': off + batch_offset,
+        }
+        
+        # Compute metrics using pre-computed values
+        for metric in metrics_list:
+            metric_scores = metric.compute(
+                model, tokenizer, device, shared_context
+            )
+            scores[metric.name].extend(metric_scores)
         
         generations.extend(generated_tokens.cpu().numpy())
     

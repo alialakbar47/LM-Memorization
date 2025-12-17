@@ -18,25 +18,14 @@ class LowercaseMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Calculate lowercase scores for a batch of generated sequences."""
-        # Calculate original NLLs
-        full_labels = generated_tokens[:, 1:].contiguous()
-        mask = (full_labels != tokenizer.pad_token_id).float()
+        # Use pre-computed original_nlls from shared context
+        original_nlls = shared_context['original_nlls']
+        generated_tokens = shared_context['generated_tokens']
         
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token_flat = F.cross_entropy(
-            full_logits, 
-            generated_tokens[:, 1:].flatten(), 
-            reduction='none'
-        )
-        
-        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
-        
-        # Calculate lowercase NLLs
+        # Calculate lowercase NLLs (must be computed separately)
         decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         lowercase_texts = [text.lower() for text in decoded_texts]
         

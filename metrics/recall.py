@@ -38,17 +38,17 @@ class SuffixRecallMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                input_ids: torch.Tensor = None,
-                suffix_len: int = 50,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute suffix recall scores."""
+        generated_tokens = shared_context['generated_tokens']
+        input_ids = shared_context['input_ids']
+        suffix_len = shared_context['suffix_len']
+        
         scores = []
         
         for batch_idx in range(generated_tokens.shape[0]):
-            prefix = input_ids[batch_idx] if input_ids is not None else generated_tokens[batch_idx][:-suffix_len]
+            prefix = input_ids[batch_idx]
             suffix = generated_tokens[batch_idx, -suffix_len:]
             
             ll_unconditional = self._get_ll(model, suffix, device)
@@ -94,22 +94,22 @@ class RecallMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                input_ids: torch.Tensor = None,
-                non_member_prefix: np.ndarray = None,
-                suffix_len: int = 50,
-                batch_offset: int = 0,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute recall scores."""
+        generated_tokens = shared_context['generated_tokens']
+        input_ids = shared_context['input_ids']
+        non_member_prefix = shared_context['non_member_prefix']
+        suffix_len = shared_context['suffix_len']
+        batch_offset = shared_context['batch_offset']
+        
         if non_member_prefix is None:
             return np.zeros(generated_tokens.shape[0])
         
         scores = []
         
         for batch_idx in range(generated_tokens.shape[0]):
-            prefix = input_ids[batch_idx] if input_ids is not None else generated_tokens[batch_idx][:-suffix_len]
+            prefix = input_ids[batch_idx]
             suffix = generated_tokens[batch_idx, -suffix_len:]
             
             nm_prefix_idx = (batch_offset + batch_idx) % len(non_member_prefix)
@@ -156,16 +156,16 @@ class ConRecallMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                non_member_prefix: np.ndarray = None,
-                member_prefix: np.ndarray = None,
-                original_nlls: torch.Tensor = None,
-                batch_offset: int = 0,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute contrastive recall scores."""
-        if non_member_prefix is None or member_prefix is None or original_nlls is None:
+        generated_tokens = shared_context['generated_tokens']
+        non_member_prefix = shared_context['non_member_prefix']
+        member_prefix = shared_context['member_prefix']
+        original_nlls = shared_context['original_nlls']
+        batch_offset = shared_context['batch_offset']
+        
+        if non_member_prefix is None or member_prefix is None:
             return np.zeros(generated_tokens.shape[0])
         
         scores = []
@@ -249,19 +249,19 @@ class SuffixConRecallMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                input_ids: torch.Tensor = None,
-                non_member_prefix: np.ndarray = None,
-                suffix_len: int = 50,
-                batch_offset: int = 0,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute suffix contrastive recall scores."""
+        generated_tokens = shared_context['generated_tokens']
+        input_ids = shared_context['input_ids']
+        non_member_prefix = shared_context['non_member_prefix']
+        suffix_len = shared_context['suffix_len']
+        batch_offset = shared_context['batch_offset']
+        
         scores = []
         
         for batch_idx in range(generated_tokens.shape[0]):
-            prefix = input_ids[batch_idx] if input_ids is not None else generated_tokens[batch_idx][:-suffix_len]
+            prefix = input_ids[batch_idx]
             suffix = generated_tokens[batch_idx, -suffix_len:]
             
             score = self._calculate_suffix_con_recall(

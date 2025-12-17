@@ -19,20 +19,33 @@ class BaseMetric(ABC):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs: Any,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: Dict[str, Any]) -> np.ndarray:
         """
-        Compute the metric score.
+        Compute the metric score using pre-computed shared values.
         
         Args:
             model: Language model
             tokenizer: Tokenizer
-            generated_tokens: Generated token sequences
-            outputs: Model outputs from forward pass
             device: Device for computation
-            **kwargs: Additional arguments
+            shared_context: Dictionary containing pre-computed values:
+                - generated_tokens: Generated token IDs
+                - input_ids: Input token IDs (prompts)
+                - outputs: Model outputs from forward pass
+                - logits: Logits from model [:, :-1]
+                - labels: Target labels (shifted tokens) [:, 1:]
+                - loss_per_token: Cross-entropy loss per token (2D)
+                - full_loss_per_token_flat: Flattened loss per token (1D)
+                - log_probs_batch: Log probabilities for all vocab
+                - token_log_probs: Log probs for actual tokens
+                - mu: Mean log probability per position
+                - sigma: Std log probability per position
+                - mask: Padding mask
+                - original_nlls: Normalized negative log-likelihood
+                - suffix_len: Length of suffix
+                - non_member_prefix: Non-member prefix data
+                - member_prefix: Member prefix data
+                - batch_offset: Batch offset for indexing
             
         Returns:
             Array of scores for each sequence

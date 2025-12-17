@@ -19,21 +19,17 @@ class ZlibMetric(BaseMetric):
     def compute(self, 
                 model,
                 tokenizer,
-                generated_tokens: torch.Tensor,
-                outputs,
                 device: torch.device,
-                **kwargs) -> np.ndarray:
+                shared_context: dict) -> np.ndarray:
         """Compute zlib compression scores."""
-        # First compute likelihood
-        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
-        full_loss_per_token_flat = F.cross_entropy(
-            full_logits, 
-            generated_tokens[:, 1:].flatten(), 
-            reduction='none'
-        )
+        # Use pre-computed loss_per_token from shared context
+        loss_per_token = shared_context['loss_per_token']
+        generated_tokens = shared_context['generated_tokens']
+        suffix_len = shared_context['suffix_len']
         
-        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -self.suffix_len:]
-        likelihood = loss_per_token.mean(1)
+        # Extract suffix portion and compute likelihood
+        loss_per_token_suffix = loss_per_token[:, -suffix_len:]
+        likelihood = loss_per_token_suffix.mean(1)
         
         # Calculate zlib compression scores
         zlib_likelihood = np.zeros_like(likelihood.cpu().numpy())
