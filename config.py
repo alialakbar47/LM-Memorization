@@ -21,6 +21,19 @@ class Config:
             else:
                 setattr(self, key, value)
     
+    def __setattr__(self, key, value):
+        """Override setattr to keep _config in sync."""
+        if key == '_config':
+            object.__setattr__(self, key, value)
+        else:
+            # Update the underlying dictionary
+            if hasattr(self, '_config'):
+                if isinstance(value, Config):
+                    self._config[key] = value.to_dict()
+                else:
+                    self._config[key] = value
+            object.__setattr__(self, key, value)
+    
     def __getitem__(self, key):
         return self._config[key]
     
@@ -31,8 +44,22 @@ class Config:
         return self._config.get(key, default)
     
     def to_dict(self):
-        """Convert config back to dictionary."""
-        return self._config
+        """Convert config back to dictionary recursively."""
+        result = {}
+        for key, value in self._config.items():
+            if isinstance(value, dict):
+                # If we have a nested Config object, convert it
+                if hasattr(self, key) and isinstance(getattr(self, key), Config):
+                    result[key] = getattr(self, key).to_dict()
+                else:
+                    result[key] = value
+            else:
+                # Use the current attribute value (may have been updated)
+                if hasattr(self, key):
+                    result[key] = getattr(self, key)
+                else:
+                    result[key] = value
+        return result
     
     @classmethod
     def from_yaml(cls, config_path: str):
