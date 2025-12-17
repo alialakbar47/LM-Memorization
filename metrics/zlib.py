@@ -1,35 +1,48 @@
 """
-Zlib compression-based scoring metric.
+Zlib compression-based metric.
 """
 
 import torch
+import torch.nn.functional as F
+import numpy as np
 import zlib
-from metrics import AbstractMetric
-from typing import Dict, Any
+from .base import BaseMetric
 
 
-class ZlibMetric(AbstractMetric):
-    def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
-        super().__init__(name, model, tokenizer, config)
-
-    def compute_score(self, generated_tokens: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Compute zlib compression scores.
-        Combines likelihood with compression ratio.
-        """
-        # First get likelihood scores
-        outputs = self.model(generated_tokens, labels=generated_tokens)
-        likelihood = outputs.loss.unsqueeze(0).expand(generated_tokens.shape[0])
+class ZlibMetric(BaseMetric):
+    """Zlib metric - combines likelihood with compression ratio."""
+    
+    def __init__(self, suffix_len: int = 50, **kwargs):
+        super().__init__(name="zlib", **kwargs)
+        self.suffix_len = suffix_len
+    
+    def compute(self, 
+                model,
+                tokenizer,
+                generated_tokens: torch.Tensor,
+                outputs,
+                device: torch.device,
+                **kwargs) -> np.ndarray:
+        """Compute zlib compression scores."""
+        # First compute likelihood
+        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        full_loss_per_token_flat = F.cross_entropy(
+            full_logits, 
+            generated_tokens[:, 1:].flatten(), 
+            reduction='none'
+        )
         
-        # Calculate compression for each sequence
-        zlib_scores = []
-        for batch_i in range(generated_tokens.shape[0]):
+        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -self.suffix_len:]
+        likelihood = loss_per_token.mean(1)
+        
+        # Calculate zlib compression scores
+        zlib_likelihood = np.zeros_like(likelihood.cpu().numpy())
+        for batch_i in range(likelihood.shape[0]):
             prompt = generated_tokens[batch_i].cpu().numpy()
             compressed_len = len(zlib.compress(prompt.tobytes()))
-            zlib_score = likelihood[batch_i].item() * compressed_len
-            zlib_scores.append(zlib_score)
+            zlib_likelihood[batch_i] = likelihood[batch_i].item() * compressed_len
         
-        return torch.tensor(zlib_scores, device=self.device)
+        return zlib_likelihood
     
-    def uses_argmin(self) -> bool:
-        return True
+    def direction(self) -> str:
+        return "min"  # Lower is better

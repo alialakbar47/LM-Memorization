@@ -1,252 +1,267 @@
-# LLM Data Extraction and MIA Evaluation
+# LLM Data Extraction and MIA Evaluation - Refactored
 
-A comprehensive framework for evaluating membership inference attacks (MIA) on language models through data extraction using multiple scoring methods.
+This is a refactored version of the LLM data extraction and membership inference attack (MIA) evaluation framework. The code has been restructured for better modularity and ease of extension.
 
-> **🎉 New!** The repository has been refactored with a modular, configuration-driven architecture. See [`QUICKSTART.md`](QUICKSTART.md) and [`REFACTORING_GUIDE.md`](REFACTORING_GUIDE.md) for details. All existing functionality remains fully backward compatible.
+## Key Improvements
 
-## Overview
+### 1. Modular Metrics System
+Metrics are now organized in a dedicated `metrics/` folder with each metric in its own file:
 
-This repository provides tools for:
-
-1. **Data Extraction**: Generate text continuations using various scoring methods
-2. **MIA Evaluation**: Assess the effectiveness of different scoring methods for membership inference attacks
-
-## Features
-
-- **Multiple Scoring Methods**: Implements various scoring approaches including likelihood, zlib compression, min-k, recall-based methods, and more
-- **Flexible Generation**: Customizable text generation parameters
-- **Comprehensive Evaluation**: Complete MIA evaluation with precision-recall metrics
-- **Pipeline Automation**: Single command to run the complete pipeline
-
-## Installation
-
-```bash
-git clone <repository-url>
-cd llm-mia-evaluation
-pip install -r requirements.txt
+```
+metrics/
+├── __init__.py          # Metric registry
+├── base.py              # Base metric class
+├── likelihood.py        # Likelihood metric
+├── zlib.py             # Zlib metric
+├── metric.py           # Metric score
+├── high_confidence.py  # High confidence metric
+├── recall.py           # Recall-based metrics
+├── lowercase.py        # Lowercase metric
+└── min_k.py            # Min-k based metrics
 ```
 
-## Quick Start
+### 2. YAML Configuration
+All hyperparameters are now managed through YAML config files instead of command-line arguments:
 
-### Complete Pipeline
+```yaml
+experiment:
+  name: my_experiment
+  seed: 2022
+  dataset_dir: ../datasets
 
-Run the entire pipeline with default settings:
+model:
+  name: EleutherAI/gpt-neo-1.3B
 
-```bash
-python run_pipeline.py --dataset_dir /path/to/datasets
+generation:
+  num_trials: 5
+  val_set_num: 1000
+  batch_size: 64
+  ...
 ```
 
-### Custom Configuration
+### 3. Organized Utilities
+Utilities are split into logical modules:
 
-```bash
-python run_pipeline.py \
-    --dataset_dir /path/to/datasets \
-    --model EleutherAI/gpt-neo-2.7B \
-    --num_trials 10 \
-    --val_set_num 500 \
-    --temperature 0.7 \
-    --top_p 0.9
 ```
-
-## Usage
-
-### Option 1: Configuration-Based Approach (New, Recommended)
-
-The repository now supports YAML-based configuration for easier experimentation:
-
-```bash
-# Edit config.yaml to customize metrics and hyperparameters
-python run_pipeline.py --config config.yaml
+utils/
+├── core.py          # Core utilities (seeds, model loading)
+├── data.py          # Data loading/saving
+├── evaluation.py    # Evaluation metrics
+└── checkpoint.py    # Checkpoint management
 ```
-
-Benefits:
-
-- Enable/disable metrics without code changes
-- Easy hyperparameter tuning
-- Shareable experiment configurations
-- Modular metric system
-
-See [`QUICKSTART.md`](QUICKSTART.md) for details.
-
-### Option 2: Command-Line Arguments (Original)
-
-### Data Extraction Only
-
-```bash
-python extract.py \
-    --dataset_dir /path/to/datasets \
-    --model EleutherAI/gpt-neo-1.3B \
-    --num_trials 5 \
-    --val_set_num 1000
-```
-
-### MIA Evaluation Only
-
-```bash
-python evaluate_mia.py \
-    --model EleutherAI/gpt-neo-1.3B \
-    --guess_dir /path/to/guess/files
-```
-
-## Dataset Requirements
-
-Your dataset directory should contain:
-
-- `train_prefix.npy`: Prefix tokens for generation
-- `train_dataset.npy`: Complete training dataset for evaluation
-- `non_member_prefix.npy` (optional): Non-member prefixes for original recall calculation
-
-## Scoring Methods
-
-The framework implements the following scoring methods:
-
-### Base Methods
-
-- **Likelihood**: Standard log-likelihood scoring
-- **Zlib**: Compression-based scoring
-- **Metric**: Likelihood with outlier removal
-- **High Confidence**: Confidence-adjusted scoring
-
-### Recall Methods
-
-- **Recall**: Conditional vs unconditional likelihood
-- **Recall2/3**: Variations of recall scoring
-- **Original Recall**: Using non-member prefixes
-
-### Min-k Methods
-
-- **Min-k**: Bottom-k token probabilities at various ratios (0.1-1.0)
-- **Min-k++**: Normalized min-k scoring
-- **Surprise**: Min-k combined with entropy thresholding
-
-### Perturbation Methods
-
-- **Lowercase**: Case perturbation scoring
 
 ## Project Structure
 
 ```
 .
-├── metrics/                  # NEW: Modular metric implementations
-│   ├── __init__.py          # Abstract base class
-│   ├── likelihood.py        # Likelihood-based scoring
-│   ├── zlib.py             # Compression scoring
-│   ├── minkprob.py         # Min-k probability
-│   └── ...                 # Other metrics
-├── config.yaml              # NEW: Configuration file
-├── metric_loader.py         # NEW: Dynamic metric loading
-├── example_usage.py         # NEW: Usage example
-├── utils.py                 # Utility functions
-├── extract.py               # Data extraction script
-├── evaluate_mia.py          # MIA evaluation script
-├── run_pipeline.py          # Complete pipeline runner
-├── QUICKSTART.md            # NEW: Quick start guide
-└── REFACTORING_GUIDE.md     # NEW: Detailed refactoring docs
+├── configs/
+│   └── extraction_default.yaml   # Example config file
+├── metrics/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── likelihood.py
+│   ├── zlib.py
+│   ├── metric.py
+│   ├── high_confidence.py
+│   ├── recall.py
+│   ├── lowercase.py
+│   └── min_k.py
+├── utils/
+│   ├── core.py
+│   ├── data.py
+│   ├── evaluation.py
+│   └── checkpoint.py
+├── config.py                      # Configuration management
+├── extract.py                     # Main extraction script
+├── evaluate_mia.py               # MIA evaluation script
+├── run_pipeline.py               # Full pipeline runner
+└── README.md
 ```
+
+## Usage
+
+### Using Config Files (Recommended)
+
+1. **Create a config file** (see `configs/extraction_default.yaml` for example)
+
+2. **Run extraction:**
+```bash
+python extract.py --config configs/my_config.yaml
+```
+
+3. **Run MIA evaluation:**
+```bash
+python evaluate_mia.py --config configs/mia_config.yaml
+```
+
+4. **Run full pipeline:**
+```bash
+python run_pipeline.py --config configs/my_config.yaml
+```
+
+### Using Command-Line Arguments
+
+You can still override config values with command-line arguments:
+
+```bash
+python extract.py --config configs/default.yaml --num_trials 10 --batch_size 32
+```
+
+Or run without a config file (uses defaults):
+
+```bash
+python extract.py --experiment_name my_exp --model EleutherAI/gpt-neo-1.3B --num_trials 5
+```
+
+### Resume from Checkpoint
+
+```bash
+python extract.py --config configs/my_config.yaml --resume
+```
+
+### Force Restart
+
+```bash
+python run_pipeline.py --config configs/my_config.yaml --force_restart
+```
+
+## Adding New Metrics
+
+To add a new metric, follow these steps:
+
+1. **Create a new file** in `metrics/` (e.g., `my_metric.py`)
+
+2. **Implement the metric class:**
+
+```python
+from .base import BaseMetric
+import numpy as np
+
+class MyMetric(BaseMetric):
+    """My custom metric."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(name="my_metric", **kwargs)
+    
+    def compute(self, model, tokenizer, generated_tokens, 
+                outputs, device, **kwargs) -> np.ndarray:
+        """Compute your metric scores."""
+        # Your implementation here
+        scores = []
+        # ... compute scores ...
+        return np.array(scores)
+    
+    def direction(self) -> str:
+        """Return 'min' or 'max' for optimization direction."""
+        return "max"  # or "min"
+```
+
+3. **Register the metric** in `metrics/__init__.py`:
+
+```python
+from .my_metric import MyMetric
+
+METRIC_REGISTRY = {
+    # ... existing metrics ...
+    'my_metric': MyMetric,
+}
+
+def get_all_metrics(...):
+    metrics = [
+        # ... existing metrics ...
+        MyMetric(),
+    ]
+    return metrics
+```
+
+4. **Use the metric:**
+
+```bash
+python extract.py --config configs/my_config.yaml --save_all_methods
+```
+
+Your new metric will automatically be:
+- Computed during extraction
+- Saved to CSV files
+- Evaluated in MIA evaluation
 
 ## Configuration Options
 
-### Generation Parameters
-
-- `--top_k`: Top-k sampling (default: 24)
-- `--top_p`: Top-p sampling (default: 0.8)
-- `--temperature`: Sampling temperature (default: 0.58)
-- `--repetition_penalty`: Repetition penalty (default: 1.04)
-
 ### Experiment Settings
+- `name`: Experiment name (creates `results/{name}/`)
+- `seed`: Random seed for reproducibility
+- `dataset_dir`: Path to dataset directory
 
-- `--num_trials`: Number of generation trials per prompt (default: 5)
-- `--val_set_num`: Number of validation examples (default: 1000)
-- `--batch_size`: Processing batch size (default: 64)
-- `--seed`: Random seed for reproducibility (default: 2022)
+### Model Settings
+- `name`: HuggingFace model name or path
 
-## Output Files
+### Generation Settings
+- `num_trials`: Number of generation trials per prompt
+- `val_set_num`: Number of validation examples to use
+- `batch_size`: Batch size for processing
+- `top_k`, `top_p`, `temperature`: Generation parameters
+- `typical_p`: Typical sampling parameter
+- `repetition_penalty`: Repetition penalty
 
-### Extraction Output
+### Saving Settings
+- `save_all_generations_per_prompt`: Save CSVs for all generation tiers
+- `save_all_methods`: Save CSVs for all metrics (not just likelihood)
+- `save_npy_files`: Save intermediate .npy files
 
-- `tmp/experiment_name/generations/`: Generated sequences
-- `tmp/experiment_name/losses/`: Scoring method results
-- `guess_*.csv`: Guess files with ground truth labels
+### Checkpoint Settings
+- `save_checkpoints`: Enable checkpointing
+- `resume`: Resume from checkpoint
+- `force_restart`: Remove existing checkpoint and restart
 
-### MIA Evaluation Output
+### Metric Settings
+- `suffix_len`: Length of suffix for metrics (default: 50)
+- `prefix_len`: Length of prefix (default: 50)
+- `k_ratios`: Ratios for min-k metrics
+- `max_entropy`: Maximum entropy threshold for surprise metric
 
-- `results/mia_evaluation/`: MIA evaluation results
-- Metrics include AUROC, FPR95, TPR05, Average Precision, and more
+## Output Structure
 
-## Pipeline Control
-
-### Skip Steps
-
-```bash
-# Skip extraction, only run MIA evaluation
-python run_pipeline.py --skip_extraction --guess_dir /path/to/existing/guesses
-
-# Skip MIA evaluation, only run extraction
-python run_pipeline.py --skip_mia
+```
+results/
+└── {experiment_name}/
+    ├── config.yaml                      # Saved configuration
+    ├── checkpoint.pkl                   # Checkpoint (if enabled)
+    ├── extraction_metrics_summary.csv   # Extraction results
+    ├── generations/                     # Generated sequences (optional)
+    ├── losses/                          # Loss values (optional)
+    ├── guess_files/                     # CSV files for MIA
+    │   ├── guess_likelihood_5.csv
+    │   └── ...
+    └── mia_evaluation/                  # MIA results
+        └── {model_name}_mia_results.csv
 ```
 
-## File Structure
+## Differences from Original
+
+### What Changed
+1. **File Organization**: Metrics moved to `metrics/`, utilities to `utils/`
+2. **Configuration**: YAML configs instead of command-line arguments
+3. **Modularity**: Each metric is a separate class with clear interface
+4. **Registry Pattern**: Metrics registered in `__init__.py` for easy discovery
+
+### What Stayed the Same
+1. **All computation logic**: Identical metric implementations
+2. **Results**: Produces exactly the same results as original code
+3. **Checkpoint system**: Same checkpointing behavior
+4. **Output format**: Same CSV and file structure
+
+## Requirements
 
 ```
-.
-├── extract.py              # Main extraction script
-├── evaluate_mia.py         # MIA evaluation script
-├── utils.py                # Utility functions
-├── run_pipeline.py         # Complete pipeline runner
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
-```
-
-## Advanced Usage
-
-### Custom Model
-
-```bash
-python run_pipeline.py \
-    --model /path/to/custom/model \
-    --dataset_dir /path/to/datasets
-```
-
-### Large Scale Experiments
-
-```bash
-python run_pipeline.py \
-    --num_trials 20 \
-    --val_set_num 5000 \
-    --batch_size 128 \
-    --experiment_name large_scale_experiment
-```
-
-### Evaluation Only with Existing Data
-
-```bash
-python evaluate_mia.py \
-    --model EleutherAI/gpt-neo-1.3B \
-    --guess_dir guess_files/
-```
-
-## Performance Tips
-
-- Use larger batch sizes for faster processing on GPUs with more memory
-- Adjust `num_trials` based on your computational budget
-- Use FP16 models for faster inference (automatically enabled)
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@misc{llm-mia-evaluation,
-  title={LLM Data Extraction and MIA Evaluation Framework},
-  year={2024},
-  howpublished={\url{https://github.com/your-repo/llm-mia-evaluation}}
-}
+torch
+transformers
+numpy
+pandas
+scikit-learn
+pyyaml
+tqdm
 ```
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+Same as original repository.

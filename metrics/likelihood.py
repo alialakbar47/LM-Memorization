@@ -1,33 +1,39 @@
 """
-Likelihood-based scoring metric.
+Likelihood-based metric.
 """
 
 import torch
 import torch.nn.functional as F
-from metrics import AbstractMetric
-from typing import Dict, Any
+import numpy as np
+from .base import BaseMetric
 
 
-class LikelihoodMetric(AbstractMetric):
-    def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
-        super().__init__(name, model, tokenizer, config)
-
-    def compute_score(self, generated_tokens: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Compute negative log-likelihood scores.
-        Lower scores indicate higher likelihood (more memorized).
-        """
-        outputs = self.model(generated_tokens, labels=generated_tokens)
-        logits = outputs.logits[:, :-1, :]
-        shift_labels = generated_tokens[:, 1:]
-        
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1))
-        loss = loss.view(shift_labels.size())
-        
-        # Mean loss per sequence (negative log-likelihood)
-        scores = loss.mean(dim=1)
-        return scores
+class LikelihoodMetric(BaseMetric):
+    """Likelihood metric - measures average token loss."""
     
-    def uses_argmin(self) -> bool:
-        return True
+    def __init__(self, suffix_len: int = 50, **kwargs):
+        super().__init__(name="likelihood", **kwargs)
+        self.suffix_len = suffix_len
+    
+    def compute(self, 
+                model,
+                tokenizer,
+                generated_tokens: torch.Tensor,
+                outputs,
+                device: torch.device,
+                **kwargs) -> np.ndarray:
+        """Compute likelihood scores (mean loss per token on suffix)."""
+        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        full_loss_per_token_flat = F.cross_entropy(
+            full_logits, 
+            generated_tokens[:, 1:].flatten(), 
+            reduction='none'
+        )
+        
+        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -self.suffix_len:]
+        likelihood = loss_per_token.mean(1)
+        
+        return likelihood.cpu().numpy()
+    
+    def direction(self) -> str:
+        return "min"  # Lower loss is better

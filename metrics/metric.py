@@ -1,49 +1,51 @@
 """
-Metric scoring with outlier removal.
+Metric score with outlier removal.
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-from metrics import AbstractMetric
-from typing import Dict, Any
+from .base import BaseMetric
 
 
-class MetricMetric(AbstractMetric):
-    def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
-        super().__init__(name, model, tokenizer, config)
-        self.num_std = config.get('num_std', 3)
-
-    def compute_score(self, generated_tokens: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Compute metric scores with outlier removal.
-        Removes tokens that are more than num_std standard deviations from mean.
-        """
-        outputs = self.model(generated_tokens, labels=generated_tokens)
-        logits = outputs.logits[:, :-1, :]
-        shift_labels = generated_tokens[:, 1:]
+class MetricMetric(BaseMetric):
+    """Metric score - likelihood with outlier removal."""
+    
+    def __init__(self, suffix_len: int = 50, **kwargs):
+        super().__init__(name="metric", **kwargs)
+        self.suffix_len = suffix_len
+    
+    def compute(self, 
+                model,
+                tokenizer,
+                generated_tokens: torch.Tensor,
+                outputs,
+                device: torch.device,
+                **kwargs) -> np.ndarray:
+        """Compute metric scores with outlier removal."""
+        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        full_loss_per_token_flat = F.cross_entropy(
+            full_logits, 
+            generated_tokens[:, 1:].flatten(), 
+            reduction='none'
+        )
         
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1))
-        loss_per_token = loss.view(shift_labels.size())
-        
-        # Convert to numpy for easier manipulation
+        loss_per_token = full_loss_per_token_flat.reshape(-1, generated_tokens.shape[1] - 1)[:, -self.suffix_len:]
         loss_per_token_np = loss_per_token.cpu().numpy()
+        
+        # Outlier removal
         mean = np.mean(loss_per_token_np, axis=-1, keepdims=True)
         std = np.std(loss_per_token_np, axis=-1, keepdims=True)
+        floor = mean - 3*std
+        upper = mean + 3*std
         
-        floor = mean - self.num_std * std
-        upper = mean + self.num_std * std
-        
-        # Replace outliers with mean
         metric_loss = np.where(
             ((loss_per_token_np < floor) | (loss_per_token_np > upper)),
             mean,
             loss_per_token_np
         )
         
-        scores = torch.tensor(metric_loss.mean(1), device=self.device)
-        return scores
+        return metric_loss.mean(1)
     
-    def uses_argmin(self) -> bool:
-        return True
+    def direction(self) -> str:
+        return "min"  # Lower is better

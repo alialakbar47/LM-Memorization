@@ -1,63 +1,69 @@
 """
-Lowercase perturbation scoring metric.
+Lowercase metric.
 """
 
 import torch
-from metrics import AbstractMetric
-from typing import Dict, Any
+import torch.nn.functional as F
+import numpy as np
+from .base import BaseMetric
 
 
-class LowercaseMetric(AbstractMetric):
-    def __init__(self, name: str, model, tokenizer, config: Dict[str, Any]):
-        super().__init__(name, model, tokenizer, config)
-
-    def compute_score(self, generated_tokens: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Compute lowercase perturbation scores.
-        Compares original vs lowercase version likelihood.
-        """
-        # Get original NLLs
-        outputs = self.model(generated_tokens, labels=generated_tokens)
-        original_nlls = []
+class LowercaseMetric(BaseMetric):
+    """Lowercase metric - compares original vs lowercase NLL."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(name="lowercase", **kwargs)
+    
+    @torch.no_grad()
+    def compute(self, 
+                model,
+                tokenizer,
+                generated_tokens: torch.Tensor,
+                outputs,
+                device: torch.device,
+                **kwargs) -> np.ndarray:
+        """Calculate lowercase scores for a batch of generated sequences."""
+        # Calculate original NLLs
+        full_labels = generated_tokens[:, 1:].contiguous()
+        mask = (full_labels != tokenizer.pad_token_id).float()
         
-        for i in range(generated_tokens.shape[0]):
-            seq_outputs = self.model(generated_tokens[i].unsqueeze(0), 
-                                    labels=generated_tokens[i].unsqueeze(0))
-            original_nlls.append(seq_outputs.loss.item())
+        full_logits = outputs.logits[:, :-1].reshape((-1, outputs.logits.shape[-1])).float()
+        full_loss_per_token_flat = F.cross_entropy(
+            full_logits, 
+            generated_tokens[:, 1:].flatten(), 
+            reduction='none'
+        )
         
-        original_nlls = torch.tensor(original_nlls, device=self.device)
+        original_nlls = (full_loss_per_token_flat.reshape(full_labels.shape) * mask).sum(dim=1) / mask.sum(dim=1)
         
-        # Decode to text and lowercase
-        decoded_texts = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        # Calculate lowercase NLLs
+        decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         lowercase_texts = [text.lower() for text in decoded_texts]
         
-        # Re-encode lowercase versions
-        lowercase_inputs = self.tokenizer(
+        lowercase_inputs = tokenizer(
             lowercase_texts,
             return_tensors='pt',
             padding=True,
             truncation=True,
             max_length=generated_tokens.shape[1]
-        ).to(self.device)
+        ).to(device)
         
-        # Get lowercase NLLs
-        lowercase_outputs = self.model(lowercase_inputs.input_ids, 
-                                      labels=lowercase_inputs.input_ids)
+        lowercase_outputs = model(lowercase_inputs.input_ids, labels=lowercase_inputs.input_ids)
         
-        lowercase_logits = lowercase_outputs.logits[..., :-1, :].contiguous()
+        lowercase_logits = lowercase_outputs.logits
+        shift_logits = lowercase_logits[..., :-1, :].contiguous()
         shift_labels = lowercase_inputs.input_ids[..., 1:].contiguous()
         
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(lowercase_logits.view(-1, lowercase_logits.size(-1)), 
-                       shift_labels.view(-1))
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         loss = loss.view(shift_labels.size())
         
-        mask = (shift_labels != self.tokenizer.pad_token_id).float()
+        mask = (shift_labels != tokenizer.pad_token_id).float()
         lowercase_nlls = (loss * mask).sum(dim=1)
         
-        # Score = -original_nll / (lowercase_nll + eps)
+        # Score = -original_nll / (lowercase_nll + 1e-9)
         scores = -original_nlls / (lowercase_nlls + 1e-9)
-        return scores
+        return scores.cpu().numpy()
     
-    def uses_argmax(self) -> bool:
-        return True
+    def direction(self) -> str:
+        return "max"  # Higher is better
