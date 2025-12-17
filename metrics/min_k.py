@@ -40,7 +40,7 @@ class MinKMetric(BaseMetric):
         return np.array(scores)
     
     def direction(self) -> str:
-        return "min"  # Lower is better (note: will be inverted for MIA)
+        return "max"  # Higher is better (argmax in old code)
 
 
 class MinKPlusMetric(BaseMetric):
@@ -80,7 +80,7 @@ class MinKPlusMetric(BaseMetric):
         return np.array(scores)
     
     def direction(self) -> str:
-        return "min"  # Lower is better (note: will be inverted for MIA)
+        return "max"  # Higher is better (argmax in old code)
 
 
 class SurpriseMetric(BaseMetric):
