@@ -25,7 +25,7 @@ class MetricMetric(BaseMetric):
         loss_per_token = shared_context['loss_per_token']
         suffix_len = shared_context['suffix_len']
         
-        # Extract suffix portion
+        # Extract suffix portion - always slice to suffix
         loss_per_token_suffix = loss_per_token[:, -suffix_len:]
         loss_per_token_np = loss_per_token_suffix.cpu().numpy()
         

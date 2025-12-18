@@ -25,10 +25,11 @@ class LikelihoodMetric(BaseMetric):
         """
         # Use pre-computed loss_per_token from shared context
         loss_per_token = shared_context['loss_per_token']
+        suffix_len = shared_context['suffix_len']
         
-        # loss_per_token is already suffix-only from shared_context in evaluate_mia
-        # In extract.py it's computed on full sequence
-        likelihood = loss_per_token.mean(1)
+        # Extract suffix portion - always slice to suffix
+        loss_per_token_suffix = loss_per_token[:, -suffix_len:]
+        likelihood = loss_per_token_suffix.mean(1)
         
         return likelihood.cpu().numpy()  # Returns positive loss values
     

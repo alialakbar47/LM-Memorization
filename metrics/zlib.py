@@ -27,7 +27,7 @@ class ZlibMetric(BaseMetric):
         generated_tokens = shared_context['generated_tokens']
         suffix_len = shared_context['suffix_len']
         
-        # Extract suffix portion and compute likelihood
+        # Extract suffix portion - always slice to suffix
         loss_per_token_suffix = loss_per_token[:, -suffix_len:]
         likelihood = loss_per_token_suffix.mean(1)
         

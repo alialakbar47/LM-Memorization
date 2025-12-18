@@ -32,32 +32,39 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
                                    suffix_len: int,
                                    non_member_prefix: np.ndarray = None,
                                    member_prefix: np.ndarray = None) -> dict:
-    """Calculate scores for MIA evaluation."""
+    """Calculate scores for MIA evaluation using metric classes.
+    
+    Passes FULL sequence values to metrics (same as extract.py).
+    Metrics internally slice to suffix.
+    """
     import torch.nn.functional as F
+    
     scores = defaultdict(list)
     
     for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Calculating scores')):
         guess = np.array(row['Suffix Guess'])
         
-        # Convert to tensor
-        generated_tokens = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        # Split into prefix and suffix
+        prefix = guess[:suffix_len]
+        suffix = guess[suffix_len:]
         
-        # Assume prefix and suffix split
-        input_ids = generated_tokens[:, :-suffix_len] if generated_tokens.shape[1] > suffix_len else generated_tokens[:, :1]
+        # Convert to tensors
+        prefix_ids = torch.tensor(prefix, dtype=torch.int64).unsqueeze(0).to(device)
+        suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(device)
+        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
         
-        # Forward pass
-        outputs = model(generated_tokens, labels=generated_tokens)
+        # Forward pass on full sequence
+        outputs = model(full_ids, labels=full_ids)
         
-        # ===== Compute all shared values (same as extract.py) =====
-        # Logits and labels
+        # ===== Compute all shared values ONCE (same as extract.py) =====
         logits = outputs.logits[:, :-1].contiguous()
-        labels = generated_tokens[:, 1:].contiguous()
+        labels = full_ids[:, 1:].contiguous()
         
         # Reshape for loss calculation
         full_logits_flat = logits.reshape((-1, logits.shape[-1])).float()
         labels_flat = labels.flatten()
         
-        # Loss per token
+        # Loss per token (FULL sequence - metrics will slice to suffix)
         full_loss_per_token_flat = F.cross_entropy(
             full_logits_flat,
             labels_flat,
@@ -65,12 +72,12 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
         )
         loss_per_token = full_loss_per_token_flat.reshape(labels.shape)
         
-        # Log probabilities
+        # Log probabilities (FULL sequence - metrics will slice to suffix)
         log_probs_batch = F.log_softmax(logits, dim=-1)
         input_ids_batch = labels.unsqueeze(-1)
         token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
         
-        # Mu and sigma for min-k++
+        # Mu and sigma for min-k++ (FULL sequence)
         mu = log_probs_batch.mean(dim=-1)
         sigma = log_probs_batch.std(dim=-1)
         
@@ -78,17 +85,17 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
         mask = (labels != tokenizer.pad_token_id).float()
         original_nlls = (loss_per_token * mask).sum(dim=1) / mask.sum(dim=1)
         
-        # Build shared context (same as extract.py)
+        # Build shared context - SAME structure as extract.py
         shared_context = {
-            'generated_tokens': generated_tokens,
-            'input_ids': input_ids,
+            'generated_tokens': full_ids,
+            'input_ids': prefix_ids,
             'outputs': outputs,
             'logits': logits,
             'labels': labels,
-            'loss_per_token': loss_per_token,
+            'loss_per_token': loss_per_token,  # FULL sequence
             'full_loss_per_token_flat': full_loss_per_token_flat,
-            'log_probs_batch': log_probs_batch,
-            'token_log_probs': token_log_probs,
+            'log_probs_batch': log_probs_batch,  # FULL sequence
+            'token_log_probs': token_log_probs,  # FULL sequence
             'mu': mu,
             'sigma': sigma,
             'mask': mask,
@@ -104,13 +111,17 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
             try:
                 metric_score = metric.compute(model, tokenizer, device, shared_context)
                 if isinstance(metric_score, np.ndarray):
-                    scores[metric.name].append(metric_score[0])
+                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
                 elif isinstance(metric_score, list):
-                    scores[metric.name].append(metric_score[0])
+                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
+                elif isinstance(metric_score, torch.Tensor):
+                    scores[metric.name].append(metric_score.item())
                 else:
-                    scores[metric.name].append(metric_score)
+                    scores[metric.name].append(float(metric_score))
             except Exception as e:
                 print(f"Warning: Error computing {metric.name}: {e}")
+                import traceback
+                traceback.print_exc()
                 scores[metric.name].append(0.0)
     
     return scores
@@ -175,10 +186,15 @@ def run_mia_evaluation(config: Config):
                 continue
             
             # For MIA, higher score should indicate membership
-            # Min-based metrics need to be inverted
-            if metric.direction() == 'min' and 'min_k' in metric.name:
+            # Loss-based metrics (direction="min") need to be negated
+            # Log-prob-based metrics (direction="max") are already correct
+            if metric.direction() == "min":
+                # These are loss-based: likelihood, zlib, metric, high_confidence
+                # Negate so higher (less loss) = member
                 method_scores = [-s for s in scores[metric.name]]
             else:
+                # These are log-prob based: min_k, min_k_plus, surprise, recalls
+                # Already higher = better
                 method_scores = scores[metric.name]
             
             metrics_result = get_mia_metrics(method_scores, labels)
