@@ -1,30 +1,24 @@
 """
-Recall-based metrics - exact match with old utils_old.py implementation.
+Recall-based metrics.
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 from .base import BaseMetric
+from transformers.cache_utils import DynamicCache
 
 
 class SuffixRecallMetric(BaseMetric):
-    """Suffix recall metric - ratio of unconditional to conditional likelihood.
-    
-    OLD FORMULA (utils_old.py lines 133-168):
-    ll_unconditional = get_ll(model, suffix_tokens, device)  # P(suffix)
-    ll_conditional = get_cond_ll(model, prefix_tokens, suffix_tokens, device)  # P(suffix | prefix)
-    score = nll_unconditional / nll_conditional
-    """
+    """Suffix recall metric - ratio of unconditional to conditional likelihood."""
     
     def __init__(self, **kwargs):
         super().__init__(name="suffix_recall", **kwargs)
     
     @torch.no_grad()
     def _get_ll(self, model, tokens: torch.Tensor, device: torch.device) -> float:
-        """Get log-likelihood P(tokens) - matches get_ll from utils_old.py."""
-        tokens = tokens.to(device)
-        outputs = model(tokens.unsqueeze(0))
+        """Helper to get the mean log-likelihood of a sequence."""
+        outputs = model(tokens.unsqueeze(0).to(device))
         logits = outputs.logits[:, :-1]
         log_probs = F.log_softmax(logits, dim=-1)
         token_log_probs = log_probs.gather(dim=-1, index=tokens[1:].unsqueeze(0).unsqueeze(-1)).squeeze()
@@ -32,21 +26,13 @@ class SuffixRecallMetric(BaseMetric):
     
     @torch.no_grad()
     def _get_cond_ll(self, model, prefix: torch.Tensor, suffix: torch.Tensor, device: torch.device) -> float:
-        """Get conditional log-likelihood P(suffix | prefix) - matches get_cond_ll from utils_old.py."""
-        prefix = prefix.to(device)
-        suffix = suffix.to(device)
-        
-        # Forward pass on full sequence
-        full_sequence = torch.cat([prefix, suffix])
-        outputs = model(full_sequence.unsqueeze(0))
-        
-        # Get logits for suffix prediction (after prefix)
-        prefix_len = len(prefix)
-        logits = outputs.logits[0, prefix_len-1:-1]  # Logits that predict suffix tokens
-        
-        # Calculate log probs for suffix tokens
+        """Helper to get the mean conditional log-likelihood of a suffix given a prefix."""
+        prefix_outputs = model(prefix.unsqueeze(0).to(device))
+        cache = DynamicCache.from_legacy_cache(prefix_outputs.past_key_values)
+        suffix_outputs = model(suffix.unsqueeze(0).to(device), past_key_values=cache)
+        logits = suffix_outputs.logits[:, :-1]
         log_probs = F.log_softmax(logits, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=suffix.unsqueeze(-1)).squeeze()
+        token_log_probs = log_probs.gather(dim=-1, index=suffix[1:].unsqueeze(0).unsqueeze(-1)).squeeze()
         return token_log_probs.mean().item()
     
     def compute(self, 
@@ -80,17 +66,7 @@ class SuffixRecallMetric(BaseMetric):
 
 
 class RecallMetric(BaseMetric):
-    """Recall metric using non-member prefix.
-    
-    OLD FORMULA (utils_old.py lines 205-222):
-    full_sequence = input_tokens + suffix_tokens
-    nll_unconditional = model(full_sequence).loss
-    
-    full_sequence_with_prefix = non_member_prefix + input_tokens + suffix_tokens
-    nll_conditional = model(full_sequence_with_prefix).loss
-    
-    score = nll_c / nll_u
-    """
+    """Recall metric using non-member prefix."""
     
     def __init__(self, **kwargs):
         super().__init__(name="recall", **kwargs)
@@ -100,17 +76,15 @@ class RecallMetric(BaseMetric):
                          input_tokens: torch.Tensor, 
                          suffix_tokens: torch.Tensor, 
                          model, device: torch.device):
-        """Calculate recall score - exact match with utils_old.py calculate_recall."""
+        """Calculate recall score based on NLL ratio."""
         non_member_prefix_tokens = non_member_prefix_tokens.to(device)
         input_tokens = input_tokens.to(device)
         suffix_tokens = suffix_tokens.to(device)
         
-        # Unconditional: full_sequence (input + suffix)
         full_sequence = torch.cat((input_tokens, suffix_tokens))
         outputs = model(full_sequence.unsqueeze(0), labels=full_sequence.unsqueeze(0))
         nll_unconditional = outputs.loss.item()
         
-        # Conditional: prepend non_member_prefix
         full_sequence_with_prefix = torch.cat((non_member_prefix_tokens, input_tokens, suffix_tokens))
         outputs_with_prefix = model(full_sequence_with_prefix.unsqueeze(0), labels=full_sequence_with_prefix.unsqueeze(0))
         nll_conditional = outputs_with_prefix.loss.item()
@@ -139,7 +113,7 @@ class RecallMetric(BaseMetric):
             suffix = generated_tokens[batch_idx, -suffix_len:]
             
             nm_prefix_idx = (batch_offset + batch_idx) % len(non_member_prefix)
-            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64, device=device)
+            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64).to(device)
             
             nll_u, nll_c = self._calculate_recall(nm_prefix, prefix, suffix, model, device)
             score = nll_c / nll_u if nll_u != 0 else 0
@@ -152,17 +126,7 @@ class RecallMetric(BaseMetric):
 
 
 class ConRecallMetric(BaseMetric):
-    """Contrastive recall metric.
-    
-    OLD FORMULA (utils_old.py lines 235-261):
-    nm_prefixed = non_member_prefix + full_sequence
-    nll_non_member = model(nm_prefixed).loss
-    
-    m_prefixed = member_prefix + full_sequence
-    nll_member = model(m_prefixed).loss
-    
-    score = (nll_non_member - nll_member) / (original_nll + 1e-9)
-    """
+    """Contrastive recall metric."""
     
     def __init__(self, **kwargs):
         super().__init__(name="con_recall", **kwargs)
@@ -173,22 +137,19 @@ class ConRecallMetric(BaseMetric):
                              full_sequence_tokens: torch.Tensor,
                              original_nll: float,
                              model, device: torch.device):
-        """Calculate contrastive recall - exact match with utils_old.py calculate_con_recall."""
+        """Calculate contrastive recall score."""
         non_member_prefix_tokens = non_member_prefix_tokens.to(device)
         member_prefix_tokens = member_prefix_tokens.to(device)
         full_sequence_tokens = full_sequence_tokens.to(device)
         
-        # Non-member prefixed sequence
         nm_prefixed_sequence = torch.cat((non_member_prefix_tokens, full_sequence_tokens))
         nm_outputs = model(nm_prefixed_sequence.unsqueeze(0), labels=nm_prefixed_sequence.unsqueeze(0))
         nll_non_member = nm_outputs.loss.item()
         
-        # Member prefixed sequence
         m_prefixed_sequence = torch.cat((member_prefix_tokens, full_sequence_tokens))
         m_outputs = model(m_prefixed_sequence.unsqueeze(0), labels=m_prefixed_sequence.unsqueeze(0))
         nll_member = m_outputs.loss.item()
         
-        # Score formula
         score = (nll_non_member - nll_member) / (original_nll + 1e-9)
         return score
     
@@ -211,10 +172,10 @@ class ConRecallMetric(BaseMetric):
         
         for batch_idx in range(generated_tokens.shape[0]):
             nm_prefix_idx = (batch_offset + batch_idx) % len(non_member_prefix)
-            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64, device=device)
+            nm_prefix = torch.tensor(non_member_prefix[nm_prefix_idx], dtype=torch.int64).to(device)
             
             m_prefix_idx = (batch_offset + batch_idx) % len(member_prefix)
-            m_prefix = torch.tensor(member_prefix[m_prefix_idx], dtype=torch.int64, device=device)
+            m_prefix = torch.tensor(member_prefix[m_prefix_idx], dtype=torch.int64).to(device)
             
             score = self._calculate_con_recall(
                 nm_prefix, m_prefix,
@@ -230,55 +191,58 @@ class ConRecallMetric(BaseMetric):
 
 
 class SuffixConRecallMetric(BaseMetric):
-    """Suffix-based contrastive recall metric.
-    
-    OLD FORMULA (utils_old.py lines 170-202):
-    original_nll = model(suffix_tokens).loss  # just suffix
-    
-    member_sequence = prefix_tokens + suffix_tokens
-    nll_member = model(member_sequence).loss
-    
-    non_member_sequence = non_member_prefix + suffix_tokens
-    nll_non_member = model(non_member_sequence).loss
-    
-    score = (nll_non_member - nll_member) / (original_nll + 1e-9)
-    """
+    """Suffix-based contrastive recall metric."""
     
     def __init__(self, **kwargs):
         super().__init__(name="suffix_conrecall", **kwargs)
     
     @torch.no_grad()
-    def _calculate_suffix_con_recall(self, prefix_tokens: torch.Tensor, 
-                                    suffix_tokens: torch.Tensor,
+    def _calculate_suffix_con_recall(self, prefix_tokens: torch.Tensor, suffix_tokens: torch.Tensor,
                                     model, tokenizer, device: torch.device,
                                     non_member_prefix_pool: np.ndarray = None,
                                     example_id: int = 0):
-        """Calculate suffix contrastive recall - exact match with utils_old.py calculate_suffix_con_recall."""
+        """Calculate suffix-based contrastive recall."""
         prefix_tokens = prefix_tokens.to(device)
         suffix_tokens = suffix_tokens.to(device)
         
-        # Original NLL (just suffix, no context)
+        # Calculate unconditional NLL of suffix
         suffix_outputs = model(suffix_tokens.unsqueeze(0), labels=suffix_tokens.unsqueeze(0))
         original_nll = suffix_outputs.loss.item()
         
-        # Member NLL (prefix + suffix)
+        # Get non-member prefix
+        if non_member_prefix_pool is not None:
+            pool_idx = example_id % len(non_member_prefix_pool)
+            selected_non_member = torch.tensor(non_member_prefix_pool[pool_idx], dtype=torch.int64, device=device)
+            
+            target_length = len(prefix_tokens)
+            if len(selected_non_member) == target_length:
+                non_member_prefix = selected_non_member
+            elif len(selected_non_member) > target_length:
+                non_member_prefix = selected_non_member[:target_length]
+            else:
+                repeats_needed = (target_length + len(selected_non_member) - 1) // len(selected_non_member)
+                repeated = selected_non_member.repeat(repeats_needed)
+                non_member_prefix = repeated[:target_length]
+        else:
+            non_member_prefix = (prefix_tokens + 1000) % tokenizer.vocab_size
+        
+        # Calculate conditional NLLs
+        prefix_len = len(prefix_tokens)
+        
+        # Member context
         member_sequence = torch.cat([prefix_tokens, suffix_tokens])
         member_outputs = model(member_sequence.unsqueeze(0), labels=member_sequence.unsqueeze(0))
-        nll_member = member_outputs.loss.item()
+        member_logits = member_outputs.logits[0, prefix_len-1:-1]
+        member_loss = F.cross_entropy(member_logits, suffix_tokens, reduction='mean')
+        nll_member = member_loss.item()
         
-        # Non-member NLL (non_member_prefix + suffix)
-        if non_member_prefix_pool is not None:
-            nm_prefix_idx = example_id % len(non_member_prefix_pool)
-            non_member_prefix = torch.tensor(non_member_prefix_pool[nm_prefix_idx], dtype=torch.int64, device=device)
-        else:
-            # Fallback if no pool provided
-            non_member_prefix = prefix_tokens
-        
+        # Non-member context
         non_member_sequence = torch.cat([non_member_prefix, suffix_tokens])
         non_member_outputs = model(non_member_sequence.unsqueeze(0), labels=non_member_sequence.unsqueeze(0))
-        nll_non_member = non_member_outputs.loss.item()
+        non_member_logits = non_member_outputs.logits[0, prefix_len-1:-1]
+        non_member_loss = F.cross_entropy(non_member_logits, suffix_tokens, reduction='mean')
+        nll_non_member = non_member_loss.item()
         
-        # Score formula (same as con_recall)
         score = (nll_non_member - nll_member) / (original_nll + 1e-9)
         return score
     

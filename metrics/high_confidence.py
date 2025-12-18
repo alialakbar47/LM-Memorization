@@ -46,7 +46,7 @@ class HighConfidenceMetric(BaseMetric):
         loss_adjusted_reshaped = loss_adjusted_flat.reshape(batch_size, seq_len)
         loss_adjusted_suffix = loss_adjusted_reshaped[:, -suffix_len:]
         
-        return loss_adjusted_suffix.mean(1).cpu().numpy()
+        return loss_adjusted_suffix.mean(1).cpu().numpy()  # Returns positive loss
     
     def direction(self) -> str:
-        return "min"  # Lower is better
+        return "min"  # Lower loss is better

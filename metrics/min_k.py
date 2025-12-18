@@ -34,15 +34,13 @@ class MinKMetric(BaseMetric):
             if k_length == 0:
                 scores.append(0.0)
             else:
-                # Return positive mean - matches extract_old.py line 245
-                # Higher log prob (less negative) = more memorized
                 score = np.mean(np.sort(seq_token_log_probs)[:k_length])
                 scores.append(score)
         
         return np.array(scores)
     
     def direction(self) -> str:
-        return "max"  # Higher is better (argmax in extract)
+        return "max"  # Higher is better (argmax in old code)
 
 
 class MinKPlusMetric(BaseMetric):
@@ -76,15 +74,13 @@ class MinKPlusMetric(BaseMetric):
             if k_length == 0:
                 scores.append(0.0)
             else:
-                # Return positive mean - matches extract_old.py line 246
-                # Higher normalized score = more memorized
                 score = np.mean(np.sort(seq_mink_plus)[:k_length])
                 scores.append(score)
         
         return np.array(scores)
     
     def direction(self) -> str:
-        return "max"  # Higher is better (argmax in extract)
+        return "max"  # Higher is better (argmax in old code)
 
 
 class SurpriseMetric(BaseMetric):

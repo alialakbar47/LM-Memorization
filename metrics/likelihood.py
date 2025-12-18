@@ -21,18 +21,16 @@ class LikelihoodMetric(BaseMetric):
                 device: torch.device,
                 shared_context: dict) -> np.ndarray:
         """Compute likelihood scores (mean loss per token on suffix).
-        OLD: loss_per_token = full_loss_per_token_flat.reshape(-1, seq_len-1)[:, -SUFFIX_LEN:]
-              likelihood = loss_per_token.mean(1)
+        Returns positive loss values for argmin selection in extraction.
         """
         # Use pre-computed loss_per_token from shared context
         loss_per_token = shared_context['loss_per_token']
-        suffix_len = shared_context['suffix_len']
         
-        # Extract suffix portion - matches old implementation
-        loss_per_token_suffix = loss_per_token[:, -suffix_len:]
-        likelihood = loss_per_token_suffix.mean(1)
+        # loss_per_token is already suffix-only from shared_context in evaluate_mia
+        # In extract.py it's computed on full sequence
+        likelihood = loss_per_token.mean(1)
         
-        return likelihood.cpu().numpy()
+        return likelihood.cpu().numpy()  # Returns positive loss values
     
     def direction(self) -> str:
         return "min"  # Lower loss is better

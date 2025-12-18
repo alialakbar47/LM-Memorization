@@ -32,78 +32,63 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
                                    suffix_len: int,
                                    non_member_prefix: np.ndarray = None,
                                    member_prefix: np.ndarray = None) -> dict:
-    """Calculate scores for MIA evaluation - matches old evaluate_mia_old.py exactly."""
+    """Calculate scores for MIA evaluation."""
     import torch.nn.functional as F
     scores = defaultdict(list)
     
     for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc='Calculating scores')):
         guess = np.array(row['Suffix Guess'])
         
-        # Split into prefix and suffix (assuming 50-50 split)
-        prefix = guess[:suffix_len]
-        suffix = guess[suffix_len:]
+        # Convert to tensor
+        generated_tokens = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
         
-        # Convert to tensors
-        prefix_ids = torch.tensor(prefix, dtype=torch.int64).unsqueeze(0).to(device)
-        suffix_ids = torch.tensor(suffix, dtype=torch.int64).unsqueeze(0).to(device)
-        full_ids = torch.tensor(guess, dtype=torch.int64).unsqueeze(0).to(device)
+        # Assume prefix and suffix split
+        input_ids = generated_tokens[:, :-suffix_len] if generated_tokens.shape[1] > suffix_len else generated_tokens[:, :1]
         
-        # Forward pass on full sequence
-        outputs = model(full_ids, labels=full_ids)
+        # Forward pass
+        outputs = model(generated_tokens, labels=generated_tokens)
         
-        # Build shared context that works with all metrics
-        # Key: We need to compute values on SUFFIX for most metrics (matching old code)
-        logits = outputs.logits
+        # ===== Compute all shared values (same as extract.py) =====
+        # Logits and labels
+        logits = outputs.logits[:, :-1].contiguous()
+        labels = generated_tokens[:, 1:].contiguous()
         
-        # Get suffix-specific values
-        suffix_logits = logits[:, -suffix_len-1:-1].contiguous()  # Logits for suffix tokens
-        suffix_labels = full_ids[:, -suffix_len:].contiguous()  # Suffix labels
+        # Reshape for loss calculation
+        full_logits_flat = logits.reshape((-1, logits.shape[-1])).float()
+        labels_flat = labels.flatten()
         
-        # Full sequence values (for recall metrics)
-        full_logits = logits[:, :-1].contiguous()
-        full_labels = full_ids[:, 1:].contiguous()
-        
-        # Loss per token (full and suffix)
-        full_loss_per_token = F.cross_entropy(
-            full_logits.reshape(-1, full_logits.shape[-1]).float(),
-            full_labels.flatten(),
+        # Loss per token
+        full_loss_per_token_flat = F.cross_entropy(
+            full_logits_flat,
+            labels_flat,
             reduction='none'
-        ).reshape(full_labels.shape)
+        )
+        loss_per_token = full_loss_per_token_flat.reshape(labels.shape)
         
-        # Suffix-only loss per token (for likelihood, zlib, metric, high_confidence)
-        suffix_loss_per_token = full_loss_per_token[:, -suffix_len:]
+        # Log probabilities
+        log_probs_batch = F.log_softmax(logits, dim=-1)
+        input_ids_batch = labels.unsqueeze(-1)
+        token_log_probs = log_probs_batch.gather(dim=-1, index=input_ids_batch).squeeze(-1)
         
-        # Token log probabilities (full and suffix)
-        log_probs_full = F.log_softmax(full_logits, dim=-1)
-        token_log_probs_full = log_probs_full.gather(
-            dim=-1, 
-            index=full_labels.unsqueeze(-1)
-        ).squeeze(-1)
-        suffix_token_log_probs = token_log_probs_full[:, -suffix_len:]
-        
-        # Mu and sigma on SUFFIX logits (for min-k++)
-        suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
-        mu = suffix_log_probs.mean(dim=-1)
-        sigma = suffix_log_probs.std(dim=-1)
+        # Mu and sigma for min-k++
+        mu = log_probs_batch.mean(dim=-1)
+        sigma = log_probs_batch.std(dim=-1)
         
         # Mask and normalized NLL
-        mask = (full_labels != tokenizer.pad_token_id).float()
-        original_nlls = (full_loss_per_token * mask).sum(dim=1) / mask.sum(dim=1)
+        mask = (labels != tokenizer.pad_token_id).float()
+        original_nlls = (loss_per_token * mask).sum(dim=1) / mask.sum(dim=1)
         
-        # Build shared context matching extract.py structure but with suffix-focused values
+        # Build shared context (same as extract.py)
         shared_context = {
-            'generated_tokens': full_ids,
-            'input_ids': prefix_ids,
-            'suffix_ids': suffix_ids,
+            'generated_tokens': generated_tokens,
+            'input_ids': input_ids,
             'outputs': outputs,
-            'logits': full_logits,  # Full logits for compatibility
-            'suffix_logits': suffix_logits,  # Suffix logits for suffix-only metrics
-            'labels': full_labels,
-            'loss_per_token': suffix_loss_per_token,  # KEY: Use suffix loss for main metrics
-            'full_loss_per_token': full_loss_per_token,  # Keep full loss for high_confidence adjustment
-            'full_loss_per_token_flat': full_loss_per_token.flatten(),
-            'log_probs_batch': suffix_log_probs,  # KEY: Use suffix log probs
-            'token_log_probs': suffix_token_log_probs,  # KEY: Use suffix token log probs
+            'logits': logits,
+            'labels': labels,
+            'loss_per_token': loss_per_token,
+            'full_loss_per_token_flat': full_loss_per_token_flat,
+            'log_probs_batch': log_probs_batch,
+            'token_log_probs': token_log_probs,
             'mu': mu,
             'sigma': sigma,
             'mask': mask,
@@ -119,17 +104,13 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
             try:
                 metric_score = metric.compute(model, tokenizer, device, shared_context)
                 if isinstance(metric_score, np.ndarray):
-                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
+                    scores[metric.name].append(metric_score[0])
                 elif isinstance(metric_score, list):
-                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
-                elif isinstance(metric_score, torch.Tensor):
-                    scores[metric.name].append(metric_score.item())
+                    scores[metric.name].append(metric_score[0])
                 else:
-                    scores[metric.name].append(float(metric_score))
+                    scores[metric.name].append(metric_score)
             except Exception as e:
                 print(f"Warning: Error computing {metric.name}: {e}")
-                import traceback
-                traceback.print_exc()
                 scores[metric.name].append(0.0)
     
     return scores
@@ -193,10 +174,9 @@ def run_mia_evaluation(config: Config):
             if metric.name not in scores or len(scores[metric.name]) == 0:
                 continue
             
-            # For MIA, higher score should always indicate membership
-            # Metrics with direction="min" return loss values (lower is better)
-            # So we invert them for MIA (multiply by -1)
-            if metric.direction() == "min":
+            # For MIA, higher score should indicate membership
+            # Min-based metrics need to be inverted
+            if metric.direction() == 'min' and 'min_k' in metric.name:
                 method_scores = [-s for s in scores[metric.name]]
             else:
                 method_scores = scores[metric.name]

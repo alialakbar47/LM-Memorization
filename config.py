@@ -156,7 +156,6 @@ def get_default_mia_config() -> Dict[str, Any]:
         'metrics': {
             'suffix_len': 50,
             'k_ratios': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            'max_entropy': 2.0,
         }
     }
 
