@@ -193,15 +193,10 @@ def run_mia_evaluation(config: Config):
             if metric.name not in scores or len(scores[metric.name]) == 0:
                 continue
             
-            # For MIA, higher score should indicate membership
-            # Min-based metrics (min_k, min_k_plus) need to be inverted
-            lower_is_better_methods = [
-                f"min_k_{r}" for r in config.metrics.k_ratios
-            ] + [
-                f"min_k_plus_{r}" for r in config.metrics.k_ratios
-            ]
-            
-            if metric.name in lower_is_better_methods:
+            # For MIA, higher score should always indicate membership
+            # Metrics with direction="min" return loss values (lower is better)
+            # So we invert them for MIA (multiply by -1)
+            if metric.direction() == "min":
                 method_scores = [-s for s in scores[metric.name]]
             else:
                 method_scores = scores[metric.name]
