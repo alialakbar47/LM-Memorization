@@ -110,14 +110,48 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
         for metric in metrics_list:
             try:
                 metric_score = metric.compute(model, tokenizer, device, shared_context)
+                
+                # Extract scalar value
                 if isinstance(metric_score, np.ndarray):
-                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
+                    score_value = metric_score[0] if len(metric_score) > 0 else 0.0
                 elif isinstance(metric_score, list):
-                    scores[metric.name].append(metric_score[0] if len(metric_score) > 0 else 0.0)
+                    score_value = metric_score[0] if len(metric_score) > 0 else 0.0
                 elif isinstance(metric_score, torch.Tensor):
-                    scores[metric.name].append(metric_score.item())
+                    score_value = metric_score.item()
                 else:
-                    scores[metric.name].append(float(metric_score))
+                    score_value = float(metric_score)
+                
+                # ========== TRANSFORMATION LAYER ==========
+                # The old evaluate_mia computed some metrics differently than extract.py:
+                # - zlib: used log_prob (negative) instead of loss (positive)
+                # - metric: negated the result (-mean instead of mean)
+                # - high_confidence: negated the result (-mean instead of mean)
+                # This layer applies transformations to match old evaluate_mia behavior
+                # while keeping metrics unchanged for extract.py
+                
+                if metric.name == 'zlib':
+                    # OLD evaluate_mia: ll * compression_ratio (where ll = log_prob, negative)
+                    # NEW metric returns: loss * compression_len (positive)
+                    # Transform: Negate to convert loss sign to log_prob sign
+                    score_value = -score_value
+                
+                elif metric.name == 'metric':
+                    # OLD evaluate_mia: -np.mean(metric_loss) (negated positive loss)
+                    # NEW metric returns: np.mean(metric_loss) (positive)
+                    # Transform: Negate to match old behavior
+                    score_value = -score_value
+                
+                elif metric.name == 'high_confidence':
+                    # OLD evaluate_mia: -np.mean(conf_loss) (negated positive loss)
+                    # NEW metric returns: np.mean(conf_loss) (positive)
+                    # Transform: Negate to match old behavior
+                    score_value = -score_value
+                
+                # All other metrics (likelihood, min_k, surprise, recalls, lowercase)
+                # already match old evaluate_mia behavior - no transformation needed
+                
+                scores[metric.name].append(score_value)
+                
             except Exception as e:
                 print(f"Warning: Error computing {metric.name}: {e}")
                 import traceback
