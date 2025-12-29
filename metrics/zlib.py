@@ -31,7 +31,8 @@ class ZlibMetric(BaseMetric):
         loss_per_token_suffix = loss_per_token[:, -suffix_len:]
         likelihood = loss_per_token_suffix.mean(1)
         
-        # Calculate zlib compression scores
+        # Calculate zlib compression scores  
+        # Matches extract_old.py: loss * compressed_len
         zlib_likelihood = np.zeros_like(likelihood.cpu().numpy())
         for batch_i in range(likelihood.shape[0]):
             prompt = generated_tokens[batch_i].cpu().numpy()
@@ -41,4 +42,4 @@ class ZlibMetric(BaseMetric):
         return zlib_likelihood
     
     def direction(self) -> str:
-        return "min"  # Lower is better
+        return "min"  # Lower is better (extract_old.py behavior)

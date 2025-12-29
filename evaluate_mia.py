@@ -123,17 +123,30 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
                 
                 # ========== TRANSFORMATION LAYER ==========
                 # The old evaluate_mia computed some metrics differently than extract.py:
-                # - zlib: used log_prob (negative) instead of loss (positive)
+                # - zlib: used text-based compression_ratio with log_prob (suffix only)
                 # - metric: negated the result (-mean instead of mean)
                 # - high_confidence: negated the result (-mean instead of mean)
                 # This layer applies transformations to match old evaluate_mia behavior
                 # while keeping metrics unchanged for extract.py
                 
                 if metric.name == 'zlib':
-                    # OLD evaluate_mia: ll * compression_ratio (where ll = log_prob, negative)
-                    # NEW metric returns: loss * compression_len (positive)
-                    # Transform: Negate to convert loss sign to log_prob sign
-                    score_value = -score_value
+                    # OLD evaluate_mia: log_prob(suffix) * text_compression_ratio
+                    # NEW metric returns: loss(suffix) * compressed_len(tokens)
+                    # Transform: Recalculate using text compression ratio and log prob
+                    import zlib
+                    
+                    # Get suffix log prob (negative of loss)
+                    loss_per_token = shared_context['loss_per_token']
+                    loss_per_token_suffix = loss_per_token[:, -suffix_len:]
+                    ll = -loss_per_token_suffix.mean(1).item()  # Convert loss to log_prob
+                    
+                    # Get text compression ratio
+                    full_ids = shared_context['generated_tokens'][0]
+                    text = tokenizer.decode(full_ids.cpu().numpy(), skip_special_tokens=True)
+                    text_bytes = text.encode('utf-8')
+                    compression_ratio = len(zlib.compress(text_bytes)) / len(text_bytes) if len(text_bytes) > 0 else 1.0
+                    
+                    score_value = ll * compression_ratio
                 
                 elif metric.name == 'metric':
                     # OLD evaluate_mia: -np.mean(metric_loss) (negated positive loss)
