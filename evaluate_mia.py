@@ -121,47 +121,8 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
                 else:
                     score_value = float(metric_score)
                 
-                # ========== TRANSFORMATION LAYER ==========
-                # The old evaluate_mia computed some metrics differently than extract.py:
-                # - zlib: used text-based compression_ratio with log_prob (suffix only)
-                # - metric: negated the result (-mean instead of mean)
-                # - high_confidence: negated the result (-mean instead of mean)
-                # This layer applies transformations to match old evaluate_mia behavior
-                # while keeping metrics unchanged for extract.py
-                
-                if metric.name == 'zlib':
-                    # OLD evaluate_mia: log_prob(suffix) * text_compression_ratio
-                    # NEW metric returns: loss(suffix) * compressed_len(tokens)
-                    # Transform: Recalculate using text compression ratio and log prob
-                    import zlib
-                    
-                    # Get suffix log prob (negative of loss)
-                    loss_per_token = shared_context['loss_per_token']
-                    loss_per_token_suffix = loss_per_token[:, -suffix_len:]
-                    ll = -loss_per_token_suffix.mean(1).item()  # Convert loss to log_prob
-                    
-                    # Get text compression ratio
-                    full_ids = shared_context['generated_tokens'][0]
-                    text = tokenizer.decode(full_ids.cpu().numpy(), skip_special_tokens=True)
-                    text_bytes = text.encode('utf-8')
-                    compression_ratio = len(zlib.compress(text_bytes)) / len(text_bytes) if len(text_bytes) > 0 else 1.0
-                    
-                    score_value = ll * compression_ratio
-                
-                elif metric.name == 'metric':
-                    # OLD evaluate_mia: -np.mean(metric_loss) (negated positive loss)
-                    # NEW metric returns: np.mean(metric_loss) (positive)
-                    # Transform: Negate to match old behavior
-                    score_value = -score_value
-                
-                elif metric.name == 'high_confidence':
-                    # OLD evaluate_mia: -np.mean(conf_loss) (negated positive loss)
-                    # NEW metric returns: np.mean(conf_loss) (positive)
-                    # Transform: Negate to match old behavior
-                    score_value = -score_value
-                
-                # All other metrics (likelihood, min_k, surprise, recalls, lowercase)
-                # already match old evaluate_mia behavior - no transformation needed
+                # No transformation needed - metrics already produce correct scores
+                # for both extract.py and evaluate_mia.py
                 
                 scores[metric.name].append(score_value)
                 
