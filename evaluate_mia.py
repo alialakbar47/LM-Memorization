@@ -121,8 +121,40 @@ def calculate_scores_for_evaluation(model, tokenizer, df: pd.DataFrame,
                 else:
                     score_value = float(metric_score)
                 
-                # No transformation needed - metrics already produce correct scores
-                # for both extract.py and evaluate_mia.py
+                # ========== TRANSFORMATION LAYER ==========
+                # Metrics are designed to match extract_old.py behavior
+                # But evaluate_mia_old.py computed some metrics differently
+                # Transform here to match evaluate_mia_old.py while keeping extract.py unchanged
+                
+                if metric.name == 'zlib':
+                    # extract_old: positive_loss * compressed_len (large positive)
+                    # evaluate_mia_old: negative_log_prob * compression_ratio (small negative)
+                    # Transform: recalculate using log_prob and text compression ratio
+                    import zlib
+                    
+                    loss_per_token = shared_context['loss_per_token']
+                    generated_tokens = shared_context['generated_tokens']
+                    
+                    # Get suffix log prob (negative of suffix loss)
+                    loss_per_token_suffix = loss_per_token[0, -suffix_len:]
+                    ll = -loss_per_token_suffix.mean().item()  # Convert loss to log_prob (negative)
+                    
+                    # Get text-based compression ratio from full sequence
+                    text = tokenizer.decode(generated_tokens[0].cpu().numpy(), skip_special_tokens=True)
+                    text_bytes = text.encode('utf-8')
+                    compression_ratio = len(zlib.compress(text_bytes)) / len(text_bytes) if len(text_bytes) > 0 else 1.0
+                    
+                    score_value = ll * compression_ratio  # negative * ratio = negative
+                
+                elif metric.name == 'metric':
+                    # extract_old: positive loss
+                    # evaluate_mia_old: -positive loss (negated)
+                    score_value = -score_value
+                
+                elif metric.name == 'high_confidence':
+                    # extract_old: positive loss
+                    # evaluate_mia_old: -positive loss (negated)
+                    score_value = -score_value
                 
                 scores[metric.name].append(score_value)
                 
